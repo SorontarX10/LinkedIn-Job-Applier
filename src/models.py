@@ -20,6 +20,8 @@ class FitDecision:
     should_apply: bool
     fit_score: int
     reasoning: str
+    requires_work_outside_poland: bool = False
+    location_restriction_reasoning: str = ""
     missing_information: list[str] = field(default_factory=list)
     tailored_cv_notes: list[str] = field(default_factory=list)
     cover_letter: str = ""

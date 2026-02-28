@@ -27,6 +27,18 @@ def _to_path(base_dir: Path, raw_path: str | None) -> Path | None:
     return (base_dir / parsed).resolve()
 
 
+def detect_system_browser_profile_dir() -> tuple[Path | None, str | None]:
+    candidates: list[tuple[Path, str]] = [
+        (Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data", "chrome"),
+        (Path.home() / "AppData" / "Local" / "Microsoft" / "Edge" / "User Data", "msedge"),
+        (Path.home() / "AppData" / "Local" / "BraveSoftware" / "Brave-Browser" / "User Data", "chrome"),
+    ]
+    for candidate_path, channel in candidates:
+        if candidate_path.exists():
+            return candidate_path, channel
+    return None, None
+
+
 @dataclass
 class Settings:
     base_dir: Path
@@ -44,6 +56,18 @@ class Settings:
     slow_mo_ms: int
     ai_disclosure_enabled: bool
     ai_disclosure_text: str
+    use_system_chrome_profile: bool
+    system_chrome_user_data_dir: Path | None
+    system_chrome_profile_name: str
+    browser_channel: str | None
+    profile_bootstrap_path: Path | None
+    profile_prompt_on_start: bool
+    always_apply_except_outside_poland: bool
+    copilot_mode: bool
+    terminal_input_enabled: bool
+    copilot_wait_timeout_sec: int
+    copilot_poll_interval_ms: int
+    copilot_auto_skip_on_timeout: bool
 
 
 def load_settings() -> Settings:
@@ -56,6 +80,8 @@ def load_settings() -> Settings:
     cv_path = _to_path(base_dir, os.getenv("CV_PATH", "").strip())
     knowledge_path = _to_path(base_dir, os.getenv("KNOWLEDGE_PATH", "data/knowledge.json"))
     browser_profile_dir = _to_path(base_dir, os.getenv("BROWSER_PROFILE_DIR", "data/browser-profile"))
+    system_chrome_user_data_dir = _to_path(base_dir, os.getenv("SYSTEM_CHROME_USER_DATA_DIR", ""))
+    profile_bootstrap_path = _to_path(base_dir, os.getenv("PROFILE_BOOTSTRAP_PATH", "data/profile.bootstrap.json"))
 
     if knowledge_path is None or browser_profile_dir is None:
         raise ValueError("KNOWLEDGE_PATH and BROWSER_PROFILE_DIR must resolve to valid paths.")
@@ -68,6 +94,23 @@ def load_settings() -> Settings:
         "AI_DISCLOSURE_TEXT",
         "This application was submitted with assistance from an AI agent.",
     ).strip()
+    use_system_chrome_profile = _to_bool(os.getenv("USE_SYSTEM_CHROME_PROFILE"), default=False)
+    system_chrome_profile_name = os.getenv("SYSTEM_CHROME_PROFILE_NAME", "Default").strip() or "Default"
+    browser_channel_raw = os.getenv("BROWSER_CHANNEL", "").strip().lower()
+    browser_channel = browser_channel_raw or None
+    profile_prompt_on_start = _to_bool(os.getenv("PROFILE_PROMPT_ON_START"), default=False)
+    always_apply_except_outside_poland = _to_bool(os.getenv("ALWAYS_APPLY_EXCEPT_OUTSIDE_POLAND"), default=True)
+    copilot_mode = _to_bool(os.getenv("COPILOT_MODE"), default=True)
+    terminal_input_enabled = _to_bool(os.getenv("TERMINAL_INPUT_ENABLED"), default=False)
+    copilot_wait_timeout_sec = max(10, int(os.getenv("COPILOT_WAIT_TIMEOUT_SEC", "240")))
+    copilot_poll_interval_ms = max(200, int(os.getenv("COPILOT_POLL_INTERVAL_MS", "900")))
+    copilot_auto_skip_on_timeout = _to_bool(os.getenv("COPILOT_AUTO_SKIP_ON_TIMEOUT"), default=True)
+
+    if use_system_chrome_profile and system_chrome_user_data_dir is None:
+        detected_dir, detected_channel = detect_system_browser_profile_dir()
+        system_chrome_user_data_dir = detected_dir
+        if not browser_channel and detected_channel:
+            browser_channel = detected_channel
     if not ai_disclosure_text:
         ai_disclosure_text = "This application was submitted with assistance from an AI agent."
 
@@ -87,4 +130,16 @@ def load_settings() -> Settings:
         slow_mo_ms=slow_mo_ms,
         ai_disclosure_enabled=ai_disclosure_enabled,
         ai_disclosure_text=ai_disclosure_text,
+        use_system_chrome_profile=use_system_chrome_profile,
+        system_chrome_user_data_dir=system_chrome_user_data_dir,
+        system_chrome_profile_name=system_chrome_profile_name,
+        browser_channel=browser_channel,
+        profile_bootstrap_path=profile_bootstrap_path,
+        profile_prompt_on_start=profile_prompt_on_start,
+        always_apply_except_outside_poland=always_apply_except_outside_poland,
+        copilot_mode=copilot_mode,
+        terminal_input_enabled=terminal_input_enabled,
+        copilot_wait_timeout_sec=copilot_wait_timeout_sec,
+        copilot_poll_interval_ms=copilot_poll_interval_ms,
+        copilot_auto_skip_on_timeout=copilot_auto_skip_on_timeout,
     )

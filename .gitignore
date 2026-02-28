@@ -9,6 +9,7 @@ __pycache__/
 .env
 
 data/knowledge.json
+data/profile.bootstrap.json
 data/browser-profile/
 
 output/*

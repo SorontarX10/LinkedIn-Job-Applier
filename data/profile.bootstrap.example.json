@@ -1,0 +1,20 @@
+{
+  "profile": {
+    "full_name": "Your Name",
+    "email": "your.email@example.com",
+    "phone": "+48 123 456 789",
+    "city": "Warsaw",
+    "country": "Poland",
+    "linkedin_url": "https://www.linkedin.com/in/your-profile",
+    "github_url": "https://github.com/your-handle",
+    "portfolio_url": "https://your-portfolio.example.com",
+    "years_of_experience": "3",
+    "work_authorization": "Authorized to work in Poland, no sponsorship required",
+    "notice_period": "1 month",
+    "expected_salary": "20000 PLN gross monthly"
+  },
+  "field_answers": {
+    "How would you describe your English skills?": "advanced",
+    "What are your salary expectations? (ONLY NUMBERS)": "20000"
+  }
+}
