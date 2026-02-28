@@ -27,6 +27,17 @@ def _to_path(base_dir: Path, raw_path: str | None) -> Path | None:
     return (base_dir / parsed).resolve()
 
 
+def _to_list(raw_value: str | None) -> tuple[str, ...]:
+    if raw_value is None:
+        return ()
+    value = raw_value.strip()
+    if not value:
+        return ()
+    normalized = value.replace("\n", ",").replace(";", ",")
+    parts = [item.strip() for item in normalized.split(",")]
+    return tuple(item for item in parts if item)
+
+
 def detect_system_browser_profile_dir() -> tuple[Path | None, str | None]:
     candidates: list[tuple[Path, str]] = [
         (Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data", "chrome"),
@@ -46,6 +57,7 @@ class Settings:
     openai_model: str
     cv_path: Path | None
     knowledge_path: Path
+    job_queue_path: Path
     browser_profile_dir: Path
     max_jobs_per_run: int
     min_fit_score: int
@@ -68,6 +80,19 @@ class Settings:
     copilot_wait_timeout_sec: int
     copilot_poll_interval_ms: int
     copilot_auto_skip_on_timeout: bool
+    agentic_fallback_max_iterations: int
+    agentic_tool_step_limit: int
+    agentic_tool_timeout_sec: int
+    agentic_blocked_action_tokens: tuple[str, ...]
+    agentic_playbook_confidence_threshold: float
+    agentic_playbook_min_uses: int
+    discovery_enabled: bool
+    discovery_keywords_include: tuple[str, ...]
+    discovery_keywords_exclude: tuple[str, ...]
+    discovery_locations: tuple[str, ...]
+    discovery_remote_only: bool
+    discovery_days_back: int
+    discovery_max_results: int
 
 
 def load_settings() -> Settings:
@@ -79,12 +104,13 @@ def load_settings() -> Settings:
 
     cv_path = _to_path(base_dir, os.getenv("CV_PATH", "").strip())
     knowledge_path = _to_path(base_dir, os.getenv("KNOWLEDGE_PATH", "data/knowledge.json"))
+    job_queue_path = _to_path(base_dir, os.getenv("JOB_QUEUE_PATH", "data/job_queue.jsonl"))
     browser_profile_dir = _to_path(base_dir, os.getenv("BROWSER_PROFILE_DIR", "data/browser-profile"))
     system_chrome_user_data_dir = _to_path(base_dir, os.getenv("SYSTEM_CHROME_USER_DATA_DIR", ""))
     profile_bootstrap_path = _to_path(base_dir, os.getenv("PROFILE_BOOTSTRAP_PATH", "data/profile.bootstrap.json"))
 
-    if knowledge_path is None or browser_profile_dir is None:
-        raise ValueError("KNOWLEDGE_PATH and BROWSER_PROFILE_DIR must resolve to valid paths.")
+    if knowledge_path is None or job_queue_path is None or browser_profile_dir is None:
+        raise ValueError("KNOWLEDGE_PATH, JOB_QUEUE_PATH and BROWSER_PROFILE_DIR must resolve to valid paths.")
 
     max_jobs_per_run = int(os.getenv("MAX_JOBS_PER_RUN", "10"))
     min_fit_score = int(os.getenv("MIN_FIT_SCORE", "50"))
@@ -105,6 +131,29 @@ def load_settings() -> Settings:
     copilot_wait_timeout_sec = max(10, int(os.getenv("COPILOT_WAIT_TIMEOUT_SEC", "240")))
     copilot_poll_interval_ms = max(200, int(os.getenv("COPILOT_POLL_INTERVAL_MS", "900")))
     copilot_auto_skip_on_timeout = _to_bool(os.getenv("COPILOT_AUTO_SKIP_ON_TIMEOUT"), default=True)
+    agentic_fallback_max_iterations = max(1, int(os.getenv("AGENTIC_FALLBACK_MAX_ITERATIONS", "4")))
+    agentic_tool_step_limit = max(4, int(os.getenv("AGENTIC_TOOL_STEP_LIMIT", "32")))
+    agentic_tool_timeout_sec = max(20, int(os.getenv("AGENTIC_TOOL_TIMEOUT_SEC", "120")))
+    blocked_raw = os.getenv(
+        "AGENTIC_BLOCKED_ACTION_TOKENS",
+        "discard,close application,withdraw,delete,remove,logout,log out,sign out,cancel application",
+    ).strip()
+    agentic_blocked_action_tokens = tuple(
+        token.strip() for token in blocked_raw.split(",") if token.strip()
+    )
+    try:
+        agentic_playbook_confidence_threshold = float(os.getenv("AGENTIC_PLAYBOOK_CONFIDENCE_THRESHOLD", "0.60"))
+    except ValueError:
+        agentic_playbook_confidence_threshold = 0.60
+    agentic_playbook_confidence_threshold = max(0.0, min(1.0, agentic_playbook_confidence_threshold))
+    agentic_playbook_min_uses = max(1, int(os.getenv("AGENTIC_PLAYBOOK_MIN_USES", "1")))
+    discovery_enabled = _to_bool(os.getenv("DISCOVERY_ENABLED"), default=False)
+    discovery_keywords_include = _to_list(os.getenv("DISCOVERY_KEYWORDS_INCLUDE", ""))
+    discovery_keywords_exclude = _to_list(os.getenv("DISCOVERY_KEYWORDS_EXCLUDE", ""))
+    discovery_locations = _to_list(os.getenv("DISCOVERY_LOCATIONS", ""))
+    discovery_remote_only = _to_bool(os.getenv("DISCOVERY_REMOTE_ONLY"), default=False)
+    discovery_days_back = max(1, int(os.getenv("DISCOVERY_DAYS_BACK", "30")))
+    discovery_max_results = max(10, int(os.getenv("DISCOVERY_MAX_RESULTS", "60")))
 
     if use_system_chrome_profile and system_chrome_user_data_dir is None:
         detected_dir, detected_channel = detect_system_browser_profile_dir()
@@ -120,6 +169,7 @@ def load_settings() -> Settings:
         openai_model=openai_model,
         cv_path=cv_path,
         knowledge_path=knowledge_path,
+        job_queue_path=job_queue_path,
         browser_profile_dir=browser_profile_dir,
         max_jobs_per_run=max_jobs_per_run,
         min_fit_score=min_fit_score,
@@ -142,4 +192,17 @@ def load_settings() -> Settings:
         copilot_wait_timeout_sec=copilot_wait_timeout_sec,
         copilot_poll_interval_ms=copilot_poll_interval_ms,
         copilot_auto_skip_on_timeout=copilot_auto_skip_on_timeout,
+        agentic_fallback_max_iterations=agentic_fallback_max_iterations,
+        agentic_tool_step_limit=agentic_tool_step_limit,
+        agentic_tool_timeout_sec=agentic_tool_timeout_sec,
+        agentic_blocked_action_tokens=agentic_blocked_action_tokens,
+        agentic_playbook_confidence_threshold=agentic_playbook_confidence_threshold,
+        agentic_playbook_min_uses=agentic_playbook_min_uses,
+        discovery_enabled=discovery_enabled,
+        discovery_keywords_include=discovery_keywords_include,
+        discovery_keywords_exclude=discovery_keywords_exclude,
+        discovery_locations=discovery_locations,
+        discovery_remote_only=discovery_remote_only,
+        discovery_days_back=discovery_days_back,
+        discovery_max_results=discovery_max_results,
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sys
 from dataclasses import asdict
@@ -77,6 +78,7 @@ class KnowledgeStore:
             "field_answers": {},
             "applications": {},
             "copilot_recipes": [],
+            "agentic_playbooks": [],
         }
         self._load()
 
@@ -96,6 +98,14 @@ class KnowledgeStore:
         self.data["copilot_recipes"] = []
         return self.data["copilot_recipes"]
 
+    @property
+    def agentic_playbooks(self) -> list[dict[str, Any]]:
+        playbooks = self.data.get("agentic_playbooks")
+        if isinstance(playbooks, list):
+            return playbooks
+        self.data["agentic_playbooks"] = []
+        return self.data["agentic_playbooks"]
+
     def _load(self) -> None:
         if not self.path.exists():
             return
@@ -106,6 +116,10 @@ class KnowledgeStore:
             self.data["applications"] = raw.get("applications", {}) or {}
             recipes = raw.get("copilot_recipes", [])
             self.data["copilot_recipes"] = recipes if isinstance(recipes, list) else []
+            playbooks = raw.get("agentic_playbooks", [])
+            self.data["agentic_playbooks"] = playbooks if isinstance(playbooks, list) else []
+            self._normalize_recipe_metrics()
+            self._normalize_playbook_metrics()
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -321,7 +335,9 @@ class KnowledgeStore:
                 continue
             if recipe.get("action_label_normalized") != normalized_label:
                 continue
+            self._ensure_recipe_metrics(recipe)
             recipe["success_count"] = int(recipe.get("success_count", 0)) + 1
+            recipe["last_used_at_utc"] = now_utc
             recipe["updated_at_utc"] = now_utc
             recipe["source"] = source
             updated = True
@@ -335,6 +351,8 @@ class KnowledgeStore:
                     "action_label_normalized": normalized_label,
                     "source": source,
                     "success_count": 1,
+                    "fail_count": 0,
+                    "last_used_at_utc": now_utc,
                     "updated_at_utc": now_utc,
                 }
             )
@@ -358,7 +376,14 @@ class KnowledgeStore:
             for recipe in self.copilot_recipes
             if isinstance(recipe, dict) and recipe.get("state_signature") == signature
         ]
-        ranked_recipes.sort(key=lambda item: int(item.get("success_count", 0)), reverse=True)
+        ranked_recipes.sort(
+            key=lambda item: (
+                int(item.get("success_count", 0)) - int(item.get("fail_count", 0)),
+                int(item.get("success_count", 0)),
+                str(item.get("last_used_at_utc", "")),
+            ),
+            reverse=True,
+        )
 
         if not ranked_recipes:
             return None, ""
@@ -380,3 +405,254 @@ class KnowledgeStore:
                 if recipe_label in candidate_label or candidate_label in recipe_label:
                     return index, "copilot_memory_partial"
         return None, ""
+
+    def remember_agentic_playbook(
+        self,
+        state_signature: str,
+        stage: str,
+        steps: list[dict[str, Any]],
+        source: str = "agentic",
+        notes: str = "",
+    ) -> str | None:
+        signature = state_signature.strip()
+        stage_key = stage.strip()
+        if not signature or not stage_key or not isinstance(steps, list) or not steps:
+            return None
+
+        normalized_steps = self._normalize_playbook_steps(steps)
+        if not normalized_steps:
+            return None
+
+        now_utc = datetime.utcnow().isoformat(timespec="seconds")
+        step_fingerprint = self._playbook_fingerprint(normalized_steps)
+        updated = False
+        for playbook in self.agentic_playbooks:
+            if not isinstance(playbook, dict):
+                continue
+            if playbook.get("state_signature") != signature:
+                continue
+            if playbook.get("stage") != stage_key:
+                continue
+            if playbook.get("step_fingerprint") != step_fingerprint:
+                continue
+
+            self._ensure_playbook_metrics(playbook)
+            playbook["updated_at_utc"] = now_utc
+            playbook["source"] = source
+            if notes.strip():
+                playbook["notes"] = notes.strip()[:240]
+            updated = True
+            break
+
+        if not updated:
+            self.agentic_playbooks.append(
+                {
+                    "state_signature": signature,
+                    "stage": stage_key,
+                    "steps": normalized_steps,
+                    "step_fingerprint": step_fingerprint,
+                    "source": source,
+                    "created_at_utc": now_utc,
+                    "updated_at_utc": now_utc,
+                    "success_count": 0,
+                    "fail_count": 0,
+                    "last_used_at_utc": "",
+                    "notes": notes.strip()[:240] if notes.strip() else "",
+                }
+            )
+
+        if len(self.agentic_playbooks) > 600:
+            self.agentic_playbooks.sort(
+                key=lambda item: str(item.get("updated_at_utc", "")),
+                reverse=True,
+            )
+            del self.agentic_playbooks[600:]
+        self.save()
+        return step_fingerprint
+
+    def get_agentic_playbooks(
+        self,
+        state_signature: str,
+        stage: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        signature = state_signature.strip()
+        if not signature:
+            return []
+        stage_value = (stage or "").strip()
+
+        matched: list[dict[str, Any]] = []
+        for playbook in self.agentic_playbooks:
+            if not isinstance(playbook, dict):
+                continue
+            if playbook.get("state_signature") != signature:
+                continue
+            if stage_value and playbook.get("stage") != stage_value:
+                continue
+            self._ensure_playbook_metrics(playbook)
+            matched.append(playbook)
+
+        matched.sort(
+            key=lambda item: (
+                int(item.get("success_count", 0)) - int(item.get("fail_count", 0)),
+                int(item.get("success_count", 0)),
+                str(item.get("last_used_at_utc", "")),
+                str(item.get("updated_at_utc", "")),
+            ),
+            reverse=True,
+        )
+        return matched[: max(1, int(limit))]
+
+    def mark_agentic_playbook_result(
+        self,
+        state_signature: str,
+        stage: str,
+        step_fingerprint: str,
+        *,
+        success: bool,
+    ) -> None:
+        signature = state_signature.strip()
+        stage_key = stage.strip()
+        fingerprint = step_fingerprint.strip()
+        if not signature or not stage_key or not fingerprint:
+            return
+
+        now_utc = datetime.utcnow().isoformat(timespec="seconds")
+        changed = False
+        for playbook in self.agentic_playbooks:
+            if not isinstance(playbook, dict):
+                continue
+            if playbook.get("state_signature") != signature:
+                continue
+            if playbook.get("stage") != stage_key:
+                continue
+            if playbook.get("step_fingerprint") != fingerprint:
+                continue
+
+            self._ensure_playbook_metrics(playbook)
+            if success:
+                playbook["success_count"] = int(playbook.get("success_count", 0)) + 1
+            else:
+                playbook["fail_count"] = int(playbook.get("fail_count", 0)) + 1
+            playbook["last_used_at_utc"] = now_utc
+            playbook["updated_at_utc"] = now_utc
+            changed = True
+            break
+        if changed:
+            self.save()
+
+    def mark_copilot_recipe_result(
+        self,
+        state_signature: str,
+        action_label: str,
+        *,
+        success: bool,
+    ) -> None:
+        signature = state_signature.strip()
+        normalized_label = _normalize(action_label)
+        if not signature or not normalized_label:
+            return
+
+        now_utc = datetime.utcnow().isoformat(timespec="seconds")
+        changed = False
+        for recipe in self.copilot_recipes:
+            if not isinstance(recipe, dict):
+                continue
+            if recipe.get("state_signature") != signature:
+                continue
+            if recipe.get("action_label_normalized") != normalized_label:
+                continue
+
+            self._ensure_recipe_metrics(recipe)
+            if success:
+                recipe["success_count"] = int(recipe.get("success_count", 0)) + 1
+            else:
+                recipe["fail_count"] = int(recipe.get("fail_count", 0)) + 1
+            recipe["last_used_at_utc"] = now_utc
+            recipe["updated_at_utc"] = now_utc
+            changed = True
+            break
+        if changed:
+            self.save()
+
+    @staticmethod
+    def _normalize_playbook_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for step in steps[:40]:
+            if not isinstance(step, dict):
+                continue
+            tool = str(step.get("tool", "")).strip().lower()
+            if not tool:
+                continue
+            payload = step.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+            compact_payload: dict[str, Any] = {}
+            for key, value in payload.items():
+                key_str = str(key).strip()[:80]
+                if not key_str:
+                    continue
+                if isinstance(value, (str, int, float, bool)):
+                    compact_payload[key_str] = value
+                else:
+                    compact_payload[key_str] = str(value)[:220]
+            normalized.append(
+                {
+                    "tool": tool[:80],
+                    "payload": compact_payload,
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _playbook_fingerprint(steps: list[dict[str, Any]]) -> str:
+        compact = json.dumps(steps, ensure_ascii=True, sort_keys=True)
+        return hashlib.sha1(compact.encode("utf-8")).hexdigest()
+
+    def _normalize_recipe_metrics(self) -> None:
+        changed = False
+        for recipe in self.copilot_recipes:
+            if not isinstance(recipe, dict):
+                continue
+            if self._ensure_recipe_metrics(recipe):
+                changed = True
+        if changed:
+            self.save()
+
+    def _normalize_playbook_metrics(self) -> None:
+        changed = False
+        for playbook in self.agentic_playbooks:
+            if not isinstance(playbook, dict):
+                continue
+            if self._ensure_playbook_metrics(playbook):
+                changed = True
+        if changed:
+            self.save()
+
+    @staticmethod
+    def _ensure_recipe_metrics(recipe: dict[str, Any]) -> bool:
+        changed = False
+        if "success_count" not in recipe:
+            recipe["success_count"] = 0
+            changed = True
+        if "fail_count" not in recipe:
+            recipe["fail_count"] = 0
+            changed = True
+        if "last_used_at_utc" not in recipe:
+            recipe["last_used_at_utc"] = ""
+            changed = True
+        return changed
+
+    @staticmethod
+    def _ensure_playbook_metrics(playbook: dict[str, Any]) -> bool:
+        changed = False
+        if "success_count" not in playbook:
+            playbook["success_count"] = 0
+            changed = True
+        if "fail_count" not in playbook:
+            playbook["fail_count"] = 0
+            changed = True
+        if "last_used_at_utc" not in playbook:
+            playbook["last_used_at_utc"] = ""
+            changed = True
+        return changed

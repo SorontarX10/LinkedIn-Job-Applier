@@ -26,6 +26,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chrome-user-data-dir", type=str, default=None, help="Chrome user data dir (for --system-chrome)")
     parser.add_argument("--chrome-profile", type=str, default=None, help="Chrome profile name, e.g. Default/Profile 1")
     parser.add_argument("--browser-channel", type=str, default=None, help="Playwright browser channel, e.g. chrome/msedge")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="saved_only",
+        choices=("saved_only", "discovery_only", "discovery_and_apply"),
+        help="Run mode: saved jobs only, discovery only, or discovery + apply",
+    )
+    parser.add_argument(
+        "--discover-max",
+        type=int,
+        default=None,
+        help="Max number of jobs to collect during discovery phase",
+    )
     return parser.parse_args()
 
 
@@ -184,6 +197,8 @@ def main() -> None:
         llm=llm,
         cv_text=cv_text,
         cv_path=cv_path,
+        run_mode=args.mode,
+        discover_max=args.discover_max,
     )
     bot.run()
 

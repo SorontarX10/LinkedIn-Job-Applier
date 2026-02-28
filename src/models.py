@@ -29,6 +29,37 @@ class FitDecision:
 
 
 @dataclass
+class DiscoveryScore:
+    skill_match_score: int
+    experience_match_score: int
+    constraint_score: int
+    applyability_score: int
+    priority_score: int
+    hard_reject: bool = False
+    reject_reason: str = ""
+    reasoning: str = ""
+
+
+@dataclass
+class QueuedJob:
+    job_id: str
+    url: str
+    source: str
+    score: int = 0
+    status: str = "queued"
+    title: str = ""
+    company: str = ""
+    location: str = ""
+    notes: str = ""
+    last_status: str = ""
+    attempt_count: int = 0
+    retry_count: int = 0
+    last_attempt_at_utc: str = ""
+    created_at_utc: str = field(default_factory=lambda: datetime.utcnow().isoformat(timespec="seconds"))
+    updated_at_utc: str = field(default_factory=lambda: datetime.utcnow().isoformat(timespec="seconds"))
+
+
+@dataclass
 class ApplicationRecord:
     url: str
     title: str

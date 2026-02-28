@@ -8,7 +8,7 @@ from typing import Any
 
 from openai import OpenAI
 
-from src.models import FitDecision, JobPosting
+from src.models import DiscoveryScore, FitDecision, JobPosting
 
 
 class LLMJobAgent:
@@ -90,6 +90,136 @@ class LLMJobAgent:
             fallback = self._heuristic_decision(job)
             fallback.reasoning = f"{fallback.reasoning} LLM error: {exc}"
             return fallback
+
+    def score_discovery_job(
+        self,
+        job: Any,
+        profile: dict[str, str],
+        known_answers: dict[str, str],
+        cv_text: str,
+        preferences: dict[str, Any] | None = None,
+    ) -> DiscoveryScore:
+        job_payload = self._coerce_discovery_job_payload(job)
+        heuristic = self._heuristic_discovery_score(
+            job_payload=job_payload,
+            profile=profile,
+            known_answers=known_answers,
+            cv_text=cv_text,
+            preferences=preferences,
+        )
+        if not self.enabled:
+            return heuristic
+
+        candidate_knowledge_json = self._build_candidate_knowledge_json(
+            profile=profile,
+            known_answers=known_answers,
+            cv_text=cv_text,
+        )
+        system_prompt = (
+            "You are a strict discovery-ranking assistant for job search.\n"
+            "Score each job using only provided candidate data and job snippet.\n"
+            "Never invent facts and never guess missing requirements.\n"
+            "Prefer realistic scoring over optimistic assumptions.\n"
+            "Return JSON only."
+        )
+        user_payload = {
+            "job": job_payload,
+            "candidate_knowledge_json": candidate_knowledge_json,
+            "preferences": preferences or {},
+            "scoring_dimensions": [
+                "skill_match_score",
+                "experience_match_score",
+                "constraint_score",
+                "applyability_score",
+            ],
+            "rules": {
+                "score_range": "0-100 integers",
+                "priority_formula": "priority_score = 0.40*skill_match_score + 0.25*experience_match_score + 0.20*constraint_score + 0.15*applyability_score",
+                "hard_reject": "true only for strong explicit mismatch (e.g. hard location/authorization mismatch from given evidence)",
+            },
+            "output_format": {
+                "skill_match_score": "integer 0-100",
+                "experience_match_score": "integer 0-100",
+                "constraint_score": "integer 0-100",
+                "applyability_score": "integer 0-100",
+                "priority_score": "integer 0-100",
+                "hard_reject": "boolean",
+                "reject_reason": "short string",
+                "reasoning": "short string",
+            },
+        }
+
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0.1,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                ],
+            )
+            raw = completion.choices[0].message.content or "{}"
+            data = self._safe_json(raw)
+
+            skill = self._safe_int(data.get("skill_match_score", heuristic.skill_match_score))
+            experience = self._safe_int(data.get("experience_match_score", heuristic.experience_match_score))
+            constraint = self._safe_int(data.get("constraint_score", heuristic.constraint_score))
+            applyability = self._safe_int(data.get("applyability_score", heuristic.applyability_score))
+            priority_raw = data.get("priority_score")
+            if priority_raw is None:
+                priority = self._compute_discovery_priority(skill, experience, constraint, applyability)
+            else:
+                priority = self._safe_int(priority_raw)
+            hard_reject = bool(data.get("hard_reject", False))
+            reject_reason = str(data.get("reject_reason", "")).strip()
+            reasoning = str(data.get("reasoning", "")).strip()
+
+            if hard_reject:
+                priority = min(priority, 20)
+
+            return DiscoveryScore(
+                skill_match_score=skill,
+                experience_match_score=experience,
+                constraint_score=constraint,
+                applyability_score=applyability,
+                priority_score=priority,
+                hard_reject=hard_reject,
+                reject_reason=reject_reason[:260],
+                reasoning=reasoning[:420],
+            )
+        except Exception as exc:
+            heuristic.reasoning = f"{heuristic.reasoning} LLM error: {exc}"
+            return heuristic
+
+    def rank_discovery_jobs(
+        self,
+        jobs: list[Any],
+        profile: dict[str, str],
+        known_answers: dict[str, str],
+        cv_text: str,
+        preferences: dict[str, Any] | None = None,
+    ) -> list[tuple[Any, DiscoveryScore]]:
+        scored: list[tuple[Any, DiscoveryScore]] = []
+        for job in jobs:
+            score = self.score_discovery_job(
+                job=job,
+                profile=profile,
+                known_answers=known_answers,
+                cv_text=cv_text,
+                preferences=preferences,
+            )
+            scored.append((job, score))
+
+        scored.sort(
+            key=lambda item: (
+                0 if item[1].hard_reject else 1,
+                item[1].priority_score,
+                item[1].skill_match_score,
+            ),
+            reverse=True,
+        )
+        return scored
 
     def choose_action_button(
         self,
@@ -543,6 +673,260 @@ class LLMJobAgent:
         normalized = re.sub(r"[^a-z0-9 ]+", " ", normalized)
         normalized = re.sub(r"\s+", " ", normalized)
         return normalized
+
+    @staticmethod
+    def _coerce_discovery_job_payload(job: Any) -> dict[str, str]:
+        if isinstance(job, dict):
+            title = str(job.get("title", "")).strip()
+            company = str(job.get("company", "")).strip()
+            location = str(job.get("location", "")).strip()
+            snippet = str(job.get("snippet", "")).strip()
+            url = str(job.get("url", "")).strip()
+            job_id = str(job.get("job_id", "")).strip()
+            source_query = str(job.get("source_query", "")).strip()
+        else:
+            title = str(getattr(job, "title", "")).strip()
+            company = str(getattr(job, "company", "")).strip()
+            location = str(getattr(job, "location", "")).strip()
+            snippet = str(getattr(job, "snippet", "")).strip()
+            url = str(getattr(job, "url", "")).strip()
+            job_id = str(getattr(job, "job_id", "")).strip()
+            source_query = str(getattr(job, "source_query", "")).strip()
+
+        return {
+            "job_id": job_id,
+            "title": title,
+            "company": company,
+            "location": location,
+            "snippet": snippet[:1200],
+            "url": url,
+            "source_query": source_query,
+        }
+
+    def _heuristic_discovery_score(
+        self,
+        job_payload: dict[str, str],
+        profile: dict[str, str],
+        known_answers: dict[str, str],
+        cv_text: str,
+        preferences: dict[str, Any] | None = None,
+    ) -> DiscoveryScore:
+        prefs = preferences or {}
+        normalized_text = self._normalize_text(
+            " ".join(
+                [
+                    job_payload.get("title", ""),
+                    job_payload.get("company", ""),
+                    job_payload.get("location", ""),
+                    job_payload.get("snippet", ""),
+                    job_payload.get("source_query", ""),
+                ]
+            )
+        )
+        job_tokens = {token for token in normalized_text.split() if len(token) >= 3}
+        candidate_tokens = self._extract_candidate_keywords(profile, known_answers, cv_text)
+
+        overlap = candidate_tokens.intersection(job_tokens)
+        overlap_ratio = len(overlap) / max(1, min(20, len(candidate_tokens)))
+        skill_score = self._safe_int(20 + int(overlap_ratio * 180))
+
+        title_norm = self._normalize_text(job_payload.get("title", ""))
+        years = self._heuristic_years_of_experience(profile, known_answers)
+        required_years = 2
+        if any(token in title_norm for token in ("principal", "staff", "head", "director")):
+            required_years = 8
+        elif any(token in title_norm for token in ("senior", "lead")):
+            required_years = 6
+        elif any(token in title_norm for token in ("junior", "intern", "trainee")):
+            required_years = 1
+        if years >= required_years + 2:
+            experience_score = 88
+        elif years >= required_years:
+            experience_score = 76
+        elif years + 2 >= required_years:
+            experience_score = 62
+        else:
+            experience_score = 42
+
+        location_norm = self._normalize_text(job_payload.get("location", ""))
+        remote_like = any(token in location_norm for token in ("remote", "hybrid", "eu", "emea"))
+        poland_like = any(
+            token in location_norm
+            for token in ("poland", "polska", "warsaw", "warszawa", "krakow", "wroclaw", "gdansk", "poznan", "lodz")
+        )
+        outside_poland_tokens = (
+            "germany",
+            "france",
+            "spain",
+            "italy",
+            "netherlands",
+            "united kingdom",
+            "ireland",
+            "sweden",
+            "norway",
+            "denmark",
+            "finland",
+            "switzerland",
+            "austria",
+            "czech",
+            "hungary",
+            "romania",
+            "bulgaria",
+            "usa",
+            "united states",
+            "canada",
+            "australia",
+        )
+        has_outside_poland = any(token in location_norm for token in outside_poland_tokens)
+
+        constraint_score = 74
+        hard_reject = False
+        reject_reason = ""
+
+        prefer_poland = bool(prefs.get("prefer_poland", True))
+        hard_reject_outside = bool(prefs.get("hard_reject_outside_poland", False))
+        if prefer_poland and has_outside_poland and not poland_like and not remote_like:
+            constraint_score = 30
+            if hard_reject_outside:
+                hard_reject = True
+                reject_reason = "Location appears outside Poland without remote flexibility."
+
+        include_tokens = [
+            self._normalize_text(str(token))
+            for token in prefs.get("keywords_include", [])
+            if self._normalize_text(str(token))
+        ]
+        exclude_tokens = [
+            self._normalize_text(str(token))
+            for token in prefs.get("keywords_exclude", [])
+            if self._normalize_text(str(token))
+        ]
+        if include_tokens:
+            include_hits = sum(1 for token in include_tokens if token in normalized_text)
+            if include_hits == 0:
+                constraint_score = min(constraint_score, 45)
+            else:
+                constraint_score = self._safe_int(constraint_score + min(20, include_hits * 6))
+        if exclude_tokens:
+            excluded = [token for token in exclude_tokens if token in normalized_text]
+            if excluded:
+                constraint_score = min(constraint_score, 15)
+                if bool(prefs.get("hard_reject_excluded_keywords", True)):
+                    hard_reject = True
+                    reject_reason = f"Contains excluded keywords: {', '.join(excluded[:3])}"
+
+        snippet_norm = self._normalize_text(job_payload.get("snippet", ""))
+        if "easy apply" in snippet_norm or "easy apply" in normalized_text:
+            applyability_score = 90
+        elif any(token in snippet_norm for token in ("apply on company website", "external", "workday", "greenhouse")):
+            applyability_score = 48
+        else:
+            applyability_score = 65
+
+        priority = self._compute_discovery_priority(
+            skill=skill_score,
+            experience=experience_score,
+            constraint=constraint_score,
+            applyability=applyability_score,
+        )
+        if hard_reject:
+            priority = min(priority, 20)
+
+        reasoning = (
+            f"Heuristic scoring: overlap={len(overlap)} candidate_tokens={len(candidate_tokens)}, "
+            f"years={years}, location='{job_payload.get('location', '')}'."
+        )
+        return DiscoveryScore(
+            skill_match_score=skill_score,
+            experience_match_score=experience_score,
+            constraint_score=self._safe_int(constraint_score),
+            applyability_score=applyability_score,
+            priority_score=priority,
+            hard_reject=hard_reject,
+            reject_reason=reject_reason[:260],
+            reasoning=reasoning[:420],
+        )
+
+    @staticmethod
+    def _heuristic_years_of_experience(profile: dict[str, str], known_answers: dict[str, str]) -> int:
+        candidate_values: list[str] = []
+        for key in ("years_of_experience", "experience_years"):
+            value = str(profile.get(key, "")).strip()
+            if value:
+                candidate_values.append(value)
+        for key, value in known_answers.items():
+            key_norm = LLMJobAgent._normalize_text(str(key))
+            if "year" in key_norm and "experience" in key_norm:
+                candidate_values.append(str(value))
+        for raw in candidate_values:
+            match = re.search(r"(\d{1,2})", raw)
+            if match:
+                try:
+                    return max(0, min(40, int(match.group(1))))
+                except ValueError:
+                    continue
+        return 3
+
+    @staticmethod
+    def _compute_discovery_priority(skill: int, experience: int, constraint: int, applyability: int) -> int:
+        raw = 0.40 * float(skill) + 0.25 * float(experience) + 0.20 * float(constraint) + 0.15 * float(applyability)
+        return max(0, min(100, int(round(raw))))
+
+    @staticmethod
+    def _extract_candidate_keywords(
+        profile: dict[str, str],
+        known_answers: dict[str, str],
+        cv_text: str,
+    ) -> set[str]:
+        raw_text_parts: list[str] = []
+        for key in ("current_title", "core_skills", "professional_summary", "city", "country"):
+            value = str(profile.get(key, "")).strip()
+            if value:
+                raw_text_parts.append(value)
+        for key, value in known_answers.items():
+            key_norm = LLMJobAgent._normalize_text(str(key))
+            if any(token in key_norm for token in ("skill", "stack", "technology", "experience", "title")):
+                raw_text_parts.append(str(value))
+        if cv_text:
+            raw_text_parts.append(cv_text[:8000])
+
+        normalized = LLMJobAgent._normalize_text(" ".join(raw_text_parts))
+        stop_words = {
+            "and",
+            "the",
+            "with",
+            "for",
+            "from",
+            "this",
+            "that",
+            "are",
+            "you",
+            "your",
+            "have",
+            "has",
+            "was",
+            "were",
+            "job",
+            "role",
+            "work",
+            "using",
+            "experience",
+            "years",
+            "year",
+            "poland",
+            "remote",
+        }
+        tokens = [token for token in normalized.split() if len(token) >= 3 and token not in stop_words]
+        unique_tokens: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            if token in seen:
+                continue
+            seen.add(token)
+            unique_tokens.append(token)
+            if len(unique_tokens) >= 120:
+                break
+        return set(unique_tokens)
 
     @staticmethod
     def _safe_int(value: Any) -> int:

@@ -15,7 +15,10 @@ from playwright_stealth import Stealth
 
 from src.config import Settings
 from src.cv_tools import write_cover_letter, write_tailored_cv_notes
+from src.agentic_fallback import AgenticFallbackController
 from src.form_helper import FormHelper
+from src.job_discovery import JobDiscovery
+from src.job_queue import JobQueueStore
 from src.knowledge_store import KnowledgeStore
 from src.llm_agent import LLMJobAgent
 from src.models import ApplicationRecord, FitDecision, JobPosting
@@ -84,6 +87,8 @@ class LinkedInJobApplier:
         llm: LLMJobAgent,
         cv_text: str,
         cv_path: Path,
+        run_mode: str = "saved_only",
+        discover_max: int | None = None,
     ):
         self.settings = settings
         self.knowledge = knowledge
@@ -91,9 +96,29 @@ class LinkedInJobApplier:
         self.cv_text = cv_text
         self.cv_path = cv_path
         self.stealth = Stealth()
+        self.agentic_fallback = AgenticFallbackController(
+            llm=self.llm,
+            knowledge=self.knowledge,
+            base_dir=self.settings.base_dir,
+            max_iterations=self.settings.agentic_fallback_max_iterations,
+            tool_step_limit=self.settings.agentic_tool_step_limit,
+            tool_timeout_sec=self.settings.agentic_tool_timeout_sec,
+            blocked_action_tokens=self.settings.agentic_blocked_action_tokens,
+            playbook_confidence_threshold=self.settings.agentic_playbook_confidence_threshold,
+            playbook_min_uses=self.settings.agentic_playbook_min_uses,
+        )
+        self.job_queue = JobQueueStore(self.settings.job_queue_path)
+        self.discovery = JobDiscovery()
+        self.run_mode = run_mode.strip().lower() if run_mode else "saved_only"
+        self.discover_max = max(1, int(discover_max)) if discover_max is not None else self.settings.discovery_max_results
         self.last_apply_note = ""
 
     def run(self) -> None:
+        allowed_modes = {"saved_only", "discovery_only", "discovery_and_apply"}
+        mode = self.run_mode if self.run_mode in allowed_modes else "saved_only"
+        if mode != self.run_mode:
+            print(f"Unknown run mode '{self.run_mode}'. Falling back to 'saved_only'.")
+
         with sync_playwright() as playwright:
             context = self._launch_context(playwright)
             try:
@@ -102,50 +127,227 @@ class LinkedInJobApplier:
                     print("Cannot continue without active LinkedIn session.")
                     return
 
-                job_urls = self._get_saved_job_urls(page)
-                if not job_urls:
-                    print("No saved jobs found.")
+                if mode in {"saved_only", "discovery_and_apply"}:
+                    saved_urls = self._sync_saved_jobs_into_queue(page)
+                    if mode == "saved_only" and not saved_urls:
+                        return
+
+                discovery_enabled_for_run = self.settings.discovery_enabled
+                if mode in {"discovery_only", "discovery_and_apply"}:
+                    if not discovery_enabled_for_run:
+                        print("Discovery is disabled (`DISCOVERY_ENABLED=false`).")
+                        if mode == "discovery_only":
+                            return
+                    else:
+                        effective_discover_max = min(self.discover_max, self.settings.discovery_max_results)
+                        summary = self._run_discovery_pipeline(page, max_results=effective_discover_max)
+                        print(
+                            "Discovery summary: "
+                            f"queries={summary['queries']}, discovered={summary['discovered']}, "
+                            f"queued={summary['queued']}, rejected={summary['rejected']}"
+                        )
+                    if mode == "discovery_only":
+                        print("Discovery-only mode completed (no apply phase).")
+                        return
+
+                queue_sources = {"saved"}
+                if mode != "saved_only" and discovery_enabled_for_run:
+                    queue_sources.add("discovery")
+                queue_urls = self.job_queue.get_top_queued_urls(
+                    limit=self.settings.max_jobs_per_run,
+                    sources=queue_sources,
+                )
+                if not queue_urls:
+                    print("No queued jobs to process for current mode.")
                     return
 
-                print(f"Saved jobs detected: {len(job_urls)}")
+                print(f"Queued jobs selected: {len(queue_urls)}")
                 processed = 0
-                for job_url in job_urls[: self.settings.max_jobs_per_run]:
+                for job_url in queue_urls:
                     processed += 1
                     print(f"\n[{processed}] Processing: {job_url}")
-                    if self._is_page_closed(page):
-                        page = context.pages[0] if context.pages else context.new_page()
-                        if not self._ensure_logged_in(page):
-                            print("Session was lost during run. Stopping.")
-                            return
+                    self.job_queue.mark_in_progress(job_url)
+                    context, page = self._recover_page_or_context(playwright, context, page)
+                    if context is None or page is None:
+                        print("Session recovery failed before processing. Stopping.")
+                        return
 
-                    try:
-                        self._process_single_job(page, context, job_url)
-                    except Exception as exc:
-                        error_name = type(exc).__name__
-                        error_text = " ".join(str(exc).split())
-                        if len(error_text) > 180:
-                            error_text = f"{error_text[:177]}..."
-                        print(f"Error while processing {job_url}: {error_name}: {error_text}")
-                        self.knowledge.save_application(
-                            ApplicationRecord(
-                                url=job_url,
-                                title="Unknown title",
-                                company="Unknown company",
-                                status="error",
-                                notes=f"{error_name}: {error_text}",
-                            )
-                        )
-
-                        if self._is_page_closed(page):
-                            try:
-                                page = context.pages[0] if context.pages else context.new_page()
-                                if not self._ensure_logged_in(page):
-                                    print("Session recovery failed after error. Stopping.")
+                    attempt = 0
+                    while attempt < 2:
+                        attempt += 1
+                        try:
+                            self._process_single_job(page, context, job_url)
+                            self._sync_job_queue_with_application_record(job_url)
+                            break
+                        except Exception as exc:
+                            if self._is_target_closed_exception(exc):
+                                print("Detected closed target/page during processing. Attempting recovery...")
+                                recovered_context, recovered_page = self._recover_page_or_context(playwright, context, page)
+                                if recovered_context is None or recovered_page is None:
+                                    print("TargetClosed recovery failed. Stopping.")
                                     return
-                            except Exception:
-                                pass
+                                context = recovered_context
+                                page = recovered_page
+                                if attempt < 2:
+                                    print("Recovered browser state. Retrying current job once.")
+                                    continue
+
+                            error_name = type(exc).__name__
+                            error_text = " ".join(str(exc).split())
+                            if len(error_text) > 180:
+                                error_text = f"{error_text[:177]}..."
+                            print(f"Error while processing {job_url}: {error_name}: {error_text}")
+                            self.knowledge.save_application(
+                                ApplicationRecord(
+                                    url=job_url,
+                                    title="Unknown title",
+                                    company="Unknown company",
+                                    status="error",
+                                    notes=f"{error_name}: {error_text}",
+                                )
+                            )
+                            self._sync_job_queue_with_application_record(job_url)
+                            context, page = self._recover_page_or_context(playwright, context, page)
+                            if context is None or page is None:
+                                print("Session recovery failed after error. Stopping.")
+                                return
+                            break
             finally:
-                context.close()
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+    def _sync_saved_jobs_into_queue(self, page: Page) -> list[str]:
+        job_urls = self._get_saved_job_urls(page)
+        if not job_urls:
+            print("No saved jobs found.")
+            return []
+
+        queued_count = self.job_queue.enqueue_saved_jobs(job_urls)
+        if queued_count:
+            print(f"Job queue synchronized from saved jobs: {queued_count} entries updated.")
+
+        print(f"Saved jobs detected: {len(job_urls)}")
+        return job_urls
+
+    def _run_discovery_pipeline(self, page: Page, max_results: int) -> dict[str, int]:
+        configured_locations = [item.strip() for item in self.settings.discovery_locations if item.strip()]
+        locations: list[str] = configured_locations
+        if not locations:
+            city = str(self.knowledge.profile.get("city", "")).strip()
+            country = str(self.knowledge.profile.get("country", "")).strip()
+            if city and country:
+                locations.append(f"{city}, {country}")
+            elif country:
+                locations.append(country)
+
+        effective_max_results = max(10, min(max_results, self.settings.discovery_max_results))
+        query_limit = max(4, min(15, (effective_max_results // 12) + 3))
+        queries = self.discovery.build_queries(
+            profile=self.knowledge.profile,
+            cv_text=self.cv_text,
+            include_keywords=list(self.settings.discovery_keywords_include),
+            exclude_keywords=list(self.settings.discovery_keywords_exclude),
+            locations=locations or None,
+            remote_only=self.settings.discovery_remote_only,
+            days_back=self.settings.discovery_days_back,
+            max_queries=query_limit,
+        )
+        if not queries:
+            return {"queries": 0, "discovered": 0, "queued": 0, "rejected": 0}
+
+        discovered_jobs = self.discovery.discover_jobs(
+            page=page,
+            queries=queries,
+            max_results=effective_max_results,
+            pages_per_query=2,
+            scroll_iterations=3,
+            scroll_px=2600,
+        )
+        if not discovered_jobs:
+            return {"queries": len(queries), "discovered": 0, "queued": 0, "rejected": 0}
+
+        ranked = self.llm.rank_discovery_jobs(
+            jobs=discovered_jobs,
+            profile=self.knowledge.profile,
+            known_answers=self.knowledge.field_answers,
+            cv_text=self.cv_text,
+            preferences={
+                "prefer_poland": True,
+                "hard_reject_outside_poland": False,
+                "keywords_include": list(self.settings.discovery_keywords_include),
+                "keywords_exclude": list(self.settings.discovery_keywords_exclude),
+            },
+        )
+
+        payload: list[dict[str, Any]] = []
+        rejected_count = 0
+        for job, score in ranked:
+            hard_reject = bool(getattr(score, "hard_reject", False))
+            if hard_reject:
+                rejected_count += 1
+            payload.append(
+                {
+                    "job_id": str(getattr(job, "job_id", "")).strip(),
+                    "url": str(getattr(job, "url", "")).strip(),
+                    "title": str(getattr(job, "title", "")).strip(),
+                    "company": str(getattr(job, "company", "")).strip(),
+                    "location": str(getattr(job, "location", "")).strip(),
+                    "score": int(getattr(score, "priority_score", 0)),
+                    "hard_reject": hard_reject,
+                    "reason": str(getattr(score, "reject_reason", "")).strip() or str(getattr(score, "reasoning", "")).strip(),
+                    "source": "discovery",
+                }
+            )
+
+        queued_count = self.job_queue.enqueue_discovery_jobs(payload)
+        top_preview = payload[:5]
+        if top_preview:
+            print("Top discovery results:")
+            for index, item in enumerate(top_preview, start=1):
+                print(
+                    f"  {index}. score={item['score']} | {item['title']} | {item['company']} | {item['location']}"
+                )
+
+        return {
+            "queries": len(queries),
+            "discovered": len(discovered_jobs),
+            "queued": queued_count,
+            "rejected": rejected_count,
+        }
+
+    def _recover_page_or_context(
+        self,
+        playwright: Playwright,
+        context: BrowserContext | None,
+        page: Page | None,
+    ) -> tuple[BrowserContext | None, Page | None]:
+        active_context = context
+        active_page = page
+
+        if active_context is None or self._is_context_closed(active_context):
+            try:
+                active_context = self._launch_context(playwright)
+            except Exception:
+                return None, None
+            active_page = None
+
+        if active_page is None or self._is_page_closed(active_page):
+            try:
+                active_page = active_context.pages[0] if active_context.pages else active_context.new_page()
+            except Exception:
+                return None, None
+
+        try:
+            if not self._ensure_logged_in(active_page):
+                return None, None
+        except Exception as exc:
+            if self._is_target_closed_exception(exc):
+                return None, None
+            return None, None
+
+        return active_context, active_page
 
     def _launch_context(self, playwright: Playwright) -> BrowserContext:
         launch_args = ["--disable-blink-features=AutomationControlled"]
@@ -310,6 +512,10 @@ class LinkedInJobApplier:
             page.mouse.wheel(0, pixels)
             page.wait_for_timeout(700)
 
+    def _sync_job_queue_with_application_record(self, job_url: str) -> None:
+        record = self.knowledge.get_application_record(job_url)
+        self.job_queue.sync_from_application_record(job_url, record)
+
     def _process_single_job(self, page: Page, context: BrowserContext, job_url: str) -> None:
         self.last_apply_note = ""
         if self.settings.skip_already_applied:
@@ -332,6 +538,15 @@ class LinkedInJobApplier:
         job = self._read_job_posting(page, job_url)
         if not job.description.strip():
             print("Skipped: missing job description.")
+            self.knowledge.save_application(
+                ApplicationRecord(
+                    url=job.url,
+                    title=job.title,
+                    company=job.company,
+                    status="skipped_missing_description",
+                    notes="missing_description",
+                )
+            )
             return
         if job.apply_mode == "unknown" and self._find_easy_apply_trigger(page):
             job.apply_mode = "easy"
@@ -688,12 +903,9 @@ class LinkedInJobApplier:
                     job=job,
                     stage="linkedin_easy_apply_modal",
                     state_signature=state_signature,
-                    candidates=candidates,
-                    locator_by_id=locator_by_id,
+                    root=modal_root,
+                    allow_plain_anchors=False,
                     helper=helper,
-                    visible_fields=visible_fields,
-                    validation_messages=validation_messages,
-                    page_signals=page_signals,
                     action_history=action_history,
                 )
                 if recovery in {"clicked", "retry"}:
@@ -1004,12 +1216,9 @@ class LinkedInJobApplier:
                     job=job,
                     stage="external_application_form",
                     state_signature=state_signature,
-                    candidates=candidates,
-                    locator_by_id=locator_by_id,
+                    root=external_page,
+                    allow_plain_anchors=True,
                     helper=helper,
-                    visible_fields=visible_fields,
-                    validation_messages=validation_messages,
-                    page_signals=page_signals,
                     action_history=action_history,
                 )
                 if recovery in {"clicked", "retry"}:
@@ -1588,11 +1797,34 @@ class LinkedInJobApplier:
             helper.add_prefilled_answers(llm_answers)
 
     @staticmethod
+    def _is_context_closed(context: BrowserContext | None) -> bool:
+        if context is None:
+            return True
+        try:
+            _ = context.pages
+            return False
+        except Exception:
+            return True
+
+    @staticmethod
     def _is_page_closed(page: Page) -> bool:
         try:
             return page.is_closed()
         except Exception:
             return True
+
+    @staticmethod
+    def _is_target_closed_exception(exc: Exception) -> bool:
+        class_name = type(exc).__name__.strip().lower()
+        if "targetclosed" in class_name:
+            return True
+        message = " ".join(str(exc).split()).lower()
+        markers = (
+            "target page, context or browser has been closed",
+            "target closed",
+            "execution context was destroyed",
+        )
+        return any(marker in message for marker in markers)
 
     @staticmethod
     def _snapshot_field_identity(field: dict[str, Any]) -> str:
@@ -1821,6 +2053,86 @@ class LinkedInJobApplier:
             print(f"[Copilot] Learned recovery action: {label}")
             return
 
+    def _learn_agentic_playbook_from_human_events(
+        self,
+        state_signature: str,
+        stage: str,
+        action_candidates: list[dict[str, str]] | None,
+        events: list[dict[str, str]],
+    ) -> None:
+        if not state_signature or not stage or not events:
+            return
+
+        candidates = action_candidates or []
+        steps: list[dict[str, Any]] = []
+        saw_field_change = False
+
+        for event in events:
+            kind = event.get("kind", "").strip().lower()
+            if kind == "click":
+                match_index = self._match_event_to_candidate(event, candidates) if candidates else None
+                if match_index is None:
+                    continue
+                label = ""
+                try:
+                    label = str(candidates[match_index].get("label", "")).strip()
+                except Exception:
+                    label = ""
+                if not label:
+                    continue
+
+                click_step = {
+                    "tool": "click_action",
+                    "payload": {
+                        "candidate_id": int(match_index),
+                        "label": label,
+                    },
+                }
+                if steps:
+                    prev = steps[-1]
+                    if (
+                        isinstance(prev, dict)
+                        and prev.get("tool") == "click_action"
+                        and str((prev.get("payload") or {}).get("label", "")).strip() == label
+                    ):
+                        continue
+                steps.append(click_step)
+                steps.append({"tool": "wait", "payload": {"ms": 700}})
+                continue
+
+            if kind in {"change", "input"}:
+                saw_field_change = True
+
+        if saw_field_change and not any(str(step.get("tool", "")) == "fill_visible_fields" for step in steps):
+            steps.insert(0, {"tool": "fill_visible_fields", "payload": {}})
+            if len(steps) > 1 and str(steps[1].get("tool", "")) != "wait":
+                steps.insert(1, {"tool": "wait", "payload": {"ms": 500}})
+
+        while steps and str(steps[-1].get("tool", "")) == "wait":
+            steps.pop()
+
+        if not steps:
+            return
+
+        steps = steps[:24]
+        fingerprint = self.knowledge.remember_agentic_playbook(
+            state_signature=state_signature,
+            stage=stage,
+            steps=steps,
+            source="human_event_sequence",
+            notes="learned from manual handoff events",
+        )
+        if not fingerprint:
+            return
+
+        self.knowledge.mark_agentic_playbook_result(
+            state_signature=state_signature,
+            stage=stage,
+            step_fingerprint=fingerprint,
+            success=True,
+        )
+        print(f"[Copilot] Learned agentic playbook from manual events ({len(steps)} steps).")
+
     def _try_copilot_memory_action(
         self,
         state_signature: str,
@@ -1837,6 +2149,14 @@ class LinkedInJobApplier:
 
         node = locator_by_id.get(index)
         if node is None:
+            if state_signature and index < len(candidates):
+                failed_label = str(candidates[index].get("label", "")).strip()
+                if failed_label:
+                    self.knowledge.mark_copilot_recipe_result(
+                        state_signature=state_signature,
+                        action_label=failed_label,
+                        success=False,
+                    )
             return False
 
         label = str(candidates[index].get("label", "")).strip() if index < len(candidates) else ""
@@ -1845,8 +2165,20 @@ class LinkedInJobApplier:
                 print(f"Copilot memory click: {label} | {reason}")
             node.click()
             self._append_action_history(action_history, label or f"memory_id={index}")
+            if state_signature and label:
+                self.knowledge.mark_copilot_recipe_result(
+                    state_signature=state_signature,
+                    action_label=label,
+                    success=True,
+                )
             return True
         except Exception:
+            if state_signature and label:
+                self.knowledge.mark_copilot_recipe_result(
+                    state_signature=state_signature,
+                    action_label=label,
+                    success=False,
+                )
             return False
 
     @staticmethod
@@ -1902,77 +2234,77 @@ class LinkedInJobApplier:
         job: JobPosting,
         stage: str,
         state_signature: str,
-        candidates: list[dict[str, str]],
-        locator_by_id: dict[int, Locator],
+        root: Page | Locator,
+        allow_plain_anchors: bool,
         helper: FormHelper,
-        visible_fields: list[dict[str, Any]],
-        validation_messages: list[str],
-        page_signals: dict[str, Any],
         action_history: list[str],
     ) -> str:
-        if not candidates and not self.settings.copilot_mode:
-            return "none"
-
         raw_html, html_excerpt = self._extract_html_excerpt(page)
         snapshot_path = self._save_stuck_html_snapshot(job=job, stage=stage, raw_html=raw_html)
         if snapshot_path is not None:
             print(f"[Copilot] Stuck HTML snapshot: {snapshot_path}")
-
-        strategy, button_id, reason = self.llm.choose_stuck_strategy(
+        outcome = self.agentic_fallback.run(
+            page=page,
+            root=root,
             job=job,
-            page_url=page.url,
             stage=stage,
-            candidates=candidates,
-            visible_fields=visible_fields,
-            validation_messages=validation_messages,
-            page_signals=page_signals,
-            recent_actions=action_history,
-            html_excerpt=html_excerpt,
+            state_signature=state_signature,
+            helper=helper,
+            action_history=action_history,
+            allow_plain_anchors=allow_plain_anchors,
         )
+        if outcome.trace_path:
+            print(f"[Copilot] Agentic trace: {outcome.trace_path}")
+        if state_signature and outcome.playbook_steps:
+            if outcome.playbook_source == "memory":
+                if outcome.playbook_fingerprint:
+                    self.knowledge.mark_agentic_playbook_result(
+                        state_signature=state_signature,
+                        stage=stage,
+                        step_fingerprint=outcome.playbook_fingerprint,
+                        success=outcome.result in {"clicked", "retry"},
+                    )
+            else:
+                step_fingerprint = self.knowledge.remember_agentic_playbook(
+                    state_signature=state_signature,
+                    stage=stage,
+                    steps=outcome.playbook_steps,
+                    source="llm_agentic",
+                    notes=outcome.reason or "",
+                )
+                if step_fingerprint:
+                    self.knowledge.mark_agentic_playbook_result(
+                        state_signature=state_signature,
+                        stage=stage,
+                        step_fingerprint=step_fingerprint,
+                        success=outcome.result in {"clicked", "retry"},
+                    )
 
-        strategy = strategy.strip().lower()
-        if strategy == "click_candidate" and button_id is not None:
-            target = locator_by_id.get(button_id)
-            if target is None:
-                return "none"
-            label = ""
-            if button_id < len(candidates):
-                label = str(candidates[button_id].get("label", "")).strip()
-            try:
-                if label:
-                    print(f"LLM stuck recovery click: {label} | {reason}")
-                target.click()
-                if label:
-                    self._append_action_history(action_history, label)
-                    if state_signature:
-                        self.knowledge.remember_copilot_recipe(
-                            state_signature=state_signature,
-                            action_label=label,
-                            source="llm_stuck",
-                        )
-                return "clicked"
-            except Exception:
-                return "none"
+        if outcome.result == "clicked":
+            label = outcome.clicked_label.strip()
+            if label:
+                print(f"LLM stuck recovery click: {label} | {outcome.reason}")
+                self._append_action_history(action_history, label)
+                if state_signature:
+                    self.knowledge.remember_copilot_recipe(
+                        state_signature=state_signature,
+                        action_label=label,
+                        source="llm_stuck",
+                    )
+            return "clicked"
 
-        if strategy == "fill_and_retry":
-            try:
-                helper.fill_visible_fields(page)
-            except Exception:
-                pass
-            if reason:
-                print(f"LLM stuck recovery: fill_and_retry | {reason}")
+        if outcome.result == "retry":
+            if outcome.reason:
+                print(f"LLM stuck recovery: retry | {outcome.reason}")
             return "retry"
 
-        if strategy == "wait_and_retry":
-            if reason:
-                print(f"LLM stuck recovery: wait_and_retry | {reason}")
-            return "retry"
-
-        if strategy == "wait_human":
-            if reason:
-                print(f"LLM stuck recovery: wait_human | {reason}")
+        if outcome.result == "human":
+            if outcome.reason:
+                print(f"LLM stuck recovery: wait_human | {outcome.reason}")
             return "human"
 
+        if html_excerpt:
+            print("LLM stuck recovery: no safe action from agentic controller.")
         return "none"
 
     def _learn_from_manual_delta(
@@ -2078,6 +2410,12 @@ class LinkedInJobApplier:
             if state_signature and action_candidates and recent_events:
                 self._learn_recipe_from_human_events(
                     state_signature=state_signature,
+                    action_candidates=action_candidates,
+                    events=recent_events,
+                )
+                self._learn_agentic_playbook_from_human_events(
+                    state_signature=state_signature,
+                    stage=stage,
                     action_candidates=action_candidates,
                     events=recent_events,
                 )
