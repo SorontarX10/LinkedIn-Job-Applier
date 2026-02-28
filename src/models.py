@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -55,8 +55,8 @@ class QueuedJob:
     attempt_count: int = 0
     retry_count: int = 0
     last_attempt_at_utc: str = ""
-    created_at_utc: str = field(default_factory=lambda: datetime.utcnow().isoformat(timespec="seconds"))
-    updated_at_utc: str = field(default_factory=lambda: datetime.utcnow().isoformat(timespec="seconds"))
+    created_at_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    updated_at_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
 
 @dataclass
@@ -65,5 +65,5 @@ class ApplicationRecord:
     title: str
     company: str
     status: str
-    applied_at_utc: str = field(default_factory=lambda: datetime.utcnow().isoformat(timespec="seconds"))
+    applied_at_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
     notes: str = ""

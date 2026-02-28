@@ -93,6 +93,10 @@ class Settings:
     discovery_remote_only: bool
     discovery_days_back: int
     discovery_max_results: int
+    discovery_cache_path: Path
+    discovery_cache_ttl_minutes: int
+    job_queue_retry_limit: int
+    job_queue_retry_cooldown_minutes: int
 
 
 def load_settings() -> Settings:
@@ -154,6 +158,12 @@ def load_settings() -> Settings:
     discovery_remote_only = _to_bool(os.getenv("DISCOVERY_REMOTE_ONLY"), default=False)
     discovery_days_back = max(1, int(os.getenv("DISCOVERY_DAYS_BACK", "30")))
     discovery_max_results = max(10, int(os.getenv("DISCOVERY_MAX_RESULTS", "60")))
+    discovery_cache_path = _to_path(base_dir, os.getenv("DISCOVERY_CACHE_PATH", "data/job_discovery_cache.json"))
+    if discovery_cache_path is None:
+        raise ValueError("DISCOVERY_CACHE_PATH must resolve to a valid path.")
+    discovery_cache_ttl_minutes = max(1, int(os.getenv("DISCOVERY_CACHE_TTL_MINUTES", "90")))
+    job_queue_retry_limit = max(1, int(os.getenv("JOB_QUEUE_RETRY_LIMIT", "3")))
+    job_queue_retry_cooldown_minutes = max(0, int(os.getenv("JOB_QUEUE_RETRY_COOLDOWN_MINUTES", "30")))
 
     if use_system_chrome_profile and system_chrome_user_data_dir is None:
         detected_dir, detected_channel = detect_system_browser_profile_dir()
@@ -205,4 +215,8 @@ def load_settings() -> Settings:
         discovery_remote_only=discovery_remote_only,
         discovery_days_back=discovery_days_back,
         discovery_max_results=discovery_max_results,
+        discovery_cache_path=discovery_cache_path,
+        discovery_cache_ttl_minutes=discovery_cache_ttl_minutes,
+        job_queue_retry_limit=job_queue_retry_limit,
+        job_queue_retry_cooldown_minutes=job_queue_retry_cooldown_minutes,
     )

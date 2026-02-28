@@ -64,15 +64,23 @@ Discovery env controls (`.env`):
 - `DISCOVERY_REMOTE_ONLY` (`true/false`)
 - `DISCOVERY_DAYS_BACK` (e.g. `7`, `30`)
 - `DISCOVERY_MAX_RESULTS` (hard cap for discovery fetch)
+- `DISCOVERY_CACHE_PATH` (cache file for discovery results)
+- `DISCOVERY_CACHE_TTL_MINUTES` (cache freshness window)
+
+Queue retry env controls (`.env`):
+- `JOB_QUEUE_RETRY_LIMIT` (max retries for `not_submitted` items)
+- `JOB_QUEUE_RETRY_COOLDOWN_MINUTES` (cooldown before item returns to queue)
 
 ## 3. Data files
 
 - `data/knowledge.json`: remembered profile facts and field answers.
 - `data/job_queue.jsonl`: durable application queue/state (`queued`, `in_progress`, `submitted`, requeue on `not_submitted`).
+- `data/job_discovery_cache.json`: cached discovery results keyed by query fingerprint and TTL.
 - `data/profile.bootstrap.json`: optional startup profile bootstrap (local only, gitignored).
 - `data/profile.bootstrap.example.json`: template for bootstrap profile data.
 - `output/cover_letters/`: generated cover letters.
 - `output/tailored_cv/`: per-job tailoring notes.
+- `output/metrics/`: run KPI reports (`latest.json`, `run_*.json`, `runs.jsonl`).
 - `data/browser-profile/`: persistent browser profile/session.
 
 ## 3.1 Discovery Module (foundation)
@@ -109,6 +117,7 @@ Discovery env controls (`.env`):
 - `AGENTIC_FALLBACK_MAX_ITERATIONS`, `AGENTIC_TOOL_STEP_LIMIT`, `AGENTIC_TOOL_TIMEOUT_SEC` tune LLM tool fallback limits.
 - `AGENTIC_BLOCKED_ACTION_TOKENS` is a safety blacklist for risky button labels in agentic click fallback.
 - `AGENTIC_PLAYBOOK_CONFIDENCE_THRESHOLD` and `AGENTIC_PLAYBOOK_MIN_USES` control when memorized playbooks can auto-run.
+- `JOB_QUEUE_RETRY_LIMIT` and `JOB_QUEUE_RETRY_COOLDOWN_MINUTES` prevent retry storms for failing postings.
 - With terminal prompts disabled, ensure `CV_PATH` and profile/bootstrap data are configured up front.
 - AI disclosure is automatically added in suitable comment/message fields and in generated cover letters.
 - Form answers are generated in the language detected from each field label/context.
@@ -120,7 +129,7 @@ Discovery env controls (`.env`):
 Run scenario tests:
 
 ```powershell
-python -m unittest -v tests/test_e2e_scenarios.py
+python -m unittest -v
 ```
 
 Covered scenarios:
@@ -128,3 +137,25 @@ Covered scenarios:
 - External apply with dynamic fields
 - External flow requiring captcha/login handoff
 - Discovery -> queue -> apply
+- Regression learning: run #2 reuses learned playbook and reduces handoff
+- Metrics/KPI report validation
+- Safety: blocked action labels are not clicked by agentic tools
+
+## 6. Metrics and QA
+
+- Every run writes KPI reports to `output/metrics/`:
+  - `latest.json` (last run snapshot),
+  - `run_<timestamp>.json` (per-run archive),
+  - `runs.jsonl` (append-only history).
+- KPI set:
+  - `application_success_rate`
+  - `fallback_trigger_rate`
+  - `fallback_recovery_success_rate`
+  - `human_handoff_rate`
+  - `mean_steps_per_application`
+  - `mean_time_per_application_sec`
+  - `playbook_hit_rate`
+  - `discovery_to_apply_conversion`
+- QA artifacts are documented in:
+  - `docs/qa_checklist.md`
+  - `docs/qa_report_template.md`

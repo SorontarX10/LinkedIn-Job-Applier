@@ -3,14 +3,22 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 
 class JobQueueStore:
-    def __init__(self, path: Path):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        retry_limit: int = 3,
+        retry_cooldown_minutes: int = 30,
+    ):
         self.path = path
+        self.retry_limit = max(1, int(retry_limit))
+        self.retry_cooldown_minutes = max(0, int(retry_cooldown_minutes))
         self._items: dict[str, dict[str, Any]] = {}
         self._load()
 
@@ -129,14 +137,25 @@ class JobQueueStore:
         )
         self._save()
 
+    def get_record(self, raw_url: str) -> dict[str, Any] | None:
+        url = self._normalize_url(raw_url)
+        if not url:
+            return None
+        record = self._items.get(url)
+        if not isinstance(record, dict):
+            return None
+        return dict(record)
+
     def get_top_queued_urls(self, limit: int, sources: set[str] | None = None) -> list[str]:
         capped = max(1, int(limit))
         source_filter = {str(source).strip().lower() for source in (sources or set()) if str(source).strip()}
+        now_utc = datetime.now(timezone.utc)
         queued_records = [
             item
             for item in self._items.values()
             if str(item.get("status", "")).strip().lower() == "queued"
             and (not source_filter or str(item.get("source", "")).strip().lower() in source_filter)
+            and self._passes_retry_policy(item=item, now_utc=now_utc)
         ]
         queued_records.sort(
             key=lambda item: (
@@ -298,4 +317,34 @@ class JobQueueStore:
 
     @staticmethod
     def _now_utc() -> str:
-        return datetime.utcnow().isoformat(timespec="seconds")
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _parse_utc(raw_value: str) -> datetime | None:
+        value = str(raw_value).strip()
+        if not value:
+            return None
+        if value.endswith("Z"):
+            value = f"{value[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _passes_retry_policy(self, item: dict[str, Any], now_utc: datetime) -> bool:
+        try:
+            retry_count = max(0, int(item.get("retry_count", 0)))
+        except (TypeError, ValueError):
+            retry_count = 0
+        if retry_count >= self.retry_limit:
+            return False
+        if self.retry_cooldown_minutes <= 0:
+            return True
+        last_attempt_raw = str(item.get("last_attempt_at_utc", "")).strip()
+        last_attempt = self._parse_utc(last_attempt_raw)
+        if last_attempt is None:
+            return True
+        return now_utc >= (last_attempt + timedelta(minutes=self.retry_cooldown_minutes))

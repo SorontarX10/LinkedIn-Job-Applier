@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urljoin
 
@@ -39,6 +42,15 @@ class DiscoveryJob:
 
 class JobDiscovery:
     SEARCH_BASE_URL = "https://www.linkedin.com/jobs/search/"
+    CACHE_VERSION = 1
+
+    def __init__(
+        self,
+        cache_path: Path | None = None,
+        cache_ttl_minutes: int = 90,
+    ) -> None:
+        self.cache_path = cache_path
+        self.cache_ttl_minutes = max(1, int(cache_ttl_minutes))
 
     def build_queries(
         self,
@@ -138,6 +150,17 @@ class JobDiscovery:
         if self._is_page_closed(page):
             return []
 
+        cache_fingerprint = self._build_cache_fingerprint(
+            queries=queries,
+            max_results=max_results,
+            pages_per_query=pages_per_query,
+            scroll_iterations=scroll_iterations,
+            scroll_px=scroll_px,
+        )
+        cached = self._load_cached_results(cache_fingerprint=cache_fingerprint)
+        if cached:
+            return cached
+
         results: list[DiscoveryJob] = []
         seen_urls: set[str] = set()
         query_pages = max(1, int(pages_per_query))
@@ -181,8 +204,139 @@ class JobDiscovery:
                         )
                     )
                     if len(results) >= result_limit:
+                        self._save_cached_results(
+                            cache_fingerprint=cache_fingerprint,
+                            queries=queries,
+                            jobs=results,
+                        )
                         return results
+        self._save_cached_results(
+            cache_fingerprint=cache_fingerprint,
+            queries=queries,
+            jobs=results,
+        )
         return results
+
+    def _build_cache_fingerprint(
+        self,
+        *,
+        queries: list[DiscoveryQuery],
+        max_results: int,
+        pages_per_query: int,
+        scroll_iterations: int,
+        scroll_px: int,
+    ) -> str:
+        payload = {
+            "version": self.CACHE_VERSION,
+            "max_results": int(max_results),
+            "pages_per_query": int(pages_per_query),
+            "scroll_iterations": int(scroll_iterations),
+            "scroll_px": int(scroll_px),
+            "queries": [
+                {
+                    "keywords": query.keywords,
+                    "location": query.location,
+                    "easy_apply_only": bool(query.easy_apply_only),
+                    "remote_only": bool(query.remote_only),
+                    "days_back": int(query.days_back),
+                    "source": query.source,
+                }
+                for query in queries
+            ],
+        }
+        compact = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha1(compact.encode("utf-8")).hexdigest()
+
+    def _load_cached_results(self, cache_fingerprint: str) -> list[DiscoveryJob]:
+        if self.cache_path is None or not self.cache_path.exists():
+            return []
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if not isinstance(payload, dict):
+            return []
+        if int(payload.get("version", 0)) != self.CACHE_VERSION:
+            return []
+        if str(payload.get("query_fingerprint", "")).strip() != cache_fingerprint:
+            return []
+        generated_at_raw = str(payload.get("generated_at_utc", "")).strip()
+        if not generated_at_raw:
+            return []
+        generated_at = self._parse_utc(generated_at_raw)
+        if generated_at is None:
+            return []
+        ttl_deadline = generated_at + timedelta(minutes=self.cache_ttl_minutes)
+        if datetime.now(timezone.utc) > ttl_deadline:
+            return []
+        cached_jobs = payload.get("jobs")
+        if not isinstance(cached_jobs, list):
+            return []
+        results: list[DiscoveryJob] = []
+        for item in cached_jobs:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url", "")).strip()
+            if not url:
+                continue
+            results.append(
+                DiscoveryJob(
+                    job_id=str(item.get("job_id", "")).strip() or self._extract_job_id(url),
+                    url=url,
+                    title=str(item.get("title", "")).strip() or "Unknown title",
+                    company=str(item.get("company", "")).strip() or "Unknown company",
+                    location=str(item.get("location", "")).strip(),
+                    snippet=str(item.get("snippet", "")).strip()[:600],
+                    source_query=str(item.get("source_query", "")).strip()[:120],
+                )
+            )
+        return results
+
+    def _save_cached_results(
+        self,
+        *,
+        cache_fingerprint: str,
+        queries: list[DiscoveryQuery],
+        jobs: list[DiscoveryJob],
+    ) -> None:
+        if self.cache_path is None:
+            return
+        payload = {
+            "version": self.CACHE_VERSION,
+            "query_fingerprint": cache_fingerprint,
+            "generated_at_utc": self._utc_now(),
+            "cache_ttl_minutes": self.cache_ttl_minutes,
+            "query_count": len(queries),
+            "result_count": len(jobs),
+            "queries": [
+                {
+                    "keywords": query.keywords,
+                    "location": query.location,
+                    "easy_apply_only": bool(query.easy_apply_only),
+                    "remote_only": bool(query.remote_only),
+                    "days_back": int(query.days_back),
+                    "source": query.source,
+                }
+                for query in queries
+            ],
+            "jobs": [
+                {
+                    "job_id": job.job_id,
+                    "url": job.url,
+                    "title": job.title,
+                    "company": job.company,
+                    "location": job.location,
+                    "snippet": job.snippet,
+                    "source_query": job.source_query,
+                }
+                for job in jobs
+            ],
+        }
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self.cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            return
 
     def _extract_profile_seed_phrases(self, profile: dict[str, str]) -> list[str]:
         fields = (
@@ -336,3 +490,22 @@ class JobDiscovery:
             return page.is_closed()
         except Exception:
             return True
+
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _parse_utc(raw_value: str) -> datetime | None:
+        candidate = raw_value.strip()
+        if not candidate:
+            return None
+        if candidate.endswith("Z"):
+            candidate = f"{candidate[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)

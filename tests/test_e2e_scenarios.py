@@ -99,6 +99,10 @@ def _make_settings(base_dir: Path) -> Settings:
         discovery_remote_only=False,
         discovery_days_back=30,
         discovery_max_results=30,
+        discovery_cache_path=base_dir / "data" / "job_discovery_cache.json",
+        discovery_cache_ttl_minutes=90,
+        job_queue_retry_limit=3,
+        job_queue_retry_cooldown_minutes=30,
     )
 
 

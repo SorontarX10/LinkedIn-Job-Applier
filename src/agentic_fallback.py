@@ -25,6 +25,7 @@ class AgenticFallbackOutcome:
     playbook_steps: list[dict[str, Any]] | None = None
     playbook_fingerprint: str = ""
     playbook_source: str = ""
+    tool_steps_used: int = 0
 
 
 class AgenticFallbackController:
@@ -170,6 +171,7 @@ class AgenticFallbackController:
                         trace_path=str(trace_path) if trace_path else "",
                         playbook_steps=playbook_steps,
                         playbook_source="llm",
+                        tool_steps_used=self.executor.steps_used,
                     )
                 continue
 
@@ -192,6 +194,7 @@ class AgenticFallbackController:
                     trace_path=str(trace_path) if trace_path else "",
                     playbook_steps=playbook_steps,
                     playbook_source="llm",
+                    tool_steps_used=self.executor.steps_used,
                 )
 
             if strategy == "wait_and_retry":
@@ -207,6 +210,7 @@ class AgenticFallbackController:
                     trace_path=str(trace_path) if trace_path else "",
                     playbook_steps=playbook_steps,
                     playbook_source="llm",
+                    tool_steps_used=self.executor.steps_used,
                 )
 
             if strategy == "wait_human":
@@ -220,6 +224,7 @@ class AgenticFallbackController:
                     trace_path=str(trace_path) if trace_path else "",
                     playbook_steps=playbook_steps,
                     playbook_source="llm",
+                    tool_steps_used=self.executor.steps_used,
                 )
 
             trace.append(trace_entry)
@@ -231,6 +236,7 @@ class AgenticFallbackController:
             trace_path=str(trace_path) if trace_path else "",
             playbook_steps=playbook_steps,
             playbook_source="llm",
+            tool_steps_used=self.executor.steps_used,
         )
 
     def _try_memory_playbooks(
@@ -312,6 +318,7 @@ class AgenticFallbackController:
                         playbook_steps=steps,
                         playbook_fingerprint=fingerprint,
                         playbook_source="memory",
+                        tool_steps_used=self.executor.steps_used,
                     )
 
                 if tool == "fill_visible_fields":
@@ -431,6 +438,7 @@ class AgenticFallbackController:
                 playbook_steps=steps,
                 playbook_fingerprint=fingerprint,
                 playbook_source="memory",
+                tool_steps_used=self.executor.steps_used,
             )
         return None
 

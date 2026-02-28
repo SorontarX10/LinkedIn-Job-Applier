@@ -5,7 +5,7 @@ import hashlib
 import re
 import sys
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -327,7 +327,7 @@ class KnowledgeStore:
             return
 
         updated = False
-        now_utc = datetime.utcnow().isoformat(timespec="seconds")
+        now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for recipe in self.copilot_recipes:
             if not isinstance(recipe, dict):
                 continue
@@ -423,7 +423,7 @@ class KnowledgeStore:
         if not normalized_steps:
             return None
 
-        now_utc = datetime.utcnow().isoformat(timespec="seconds")
+        now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
         step_fingerprint = self._playbook_fingerprint(normalized_steps)
         updated = False
         for playbook in self.agentic_playbooks:
@@ -517,7 +517,7 @@ class KnowledgeStore:
         if not signature or not stage_key or not fingerprint:
             return
 
-        now_utc = datetime.utcnow().isoformat(timespec="seconds")
+        now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
         changed = False
         for playbook in self.agentic_playbooks:
             if not isinstance(playbook, dict):
@@ -553,7 +553,7 @@ class KnowledgeStore:
         if not signature or not normalized_label:
             return
 
-        now_utc = datetime.utcnow().isoformat(timespec="seconds")
+        now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
         changed = False
         for recipe in self.copilot_recipes:
             if not isinstance(recipe, dict):

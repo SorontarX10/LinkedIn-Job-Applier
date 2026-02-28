@@ -22,6 +22,7 @@ from src.job_queue import JobQueueStore
 from src.knowledge_store import KnowledgeStore
 from src.llm_agent import LLMJobAgent
 from src.models import ApplicationRecord, FitDecision, JobPosting
+from src.run_metrics import RunMetricsTracker
 
 
 def _normalize(text: str) -> str:
@@ -107,10 +108,18 @@ class LinkedInJobApplier:
             playbook_confidence_threshold=self.settings.agentic_playbook_confidence_threshold,
             playbook_min_uses=self.settings.agentic_playbook_min_uses,
         )
-        self.job_queue = JobQueueStore(self.settings.job_queue_path)
-        self.discovery = JobDiscovery()
+        self.job_queue = JobQueueStore(
+            self.settings.job_queue_path,
+            retry_limit=self.settings.job_queue_retry_limit,
+            retry_cooldown_minutes=self.settings.job_queue_retry_cooldown_minutes,
+        )
+        self.discovery = JobDiscovery(
+            cache_path=self.settings.discovery_cache_path,
+            cache_ttl_minutes=self.settings.discovery_cache_ttl_minutes,
+        )
         self.run_mode = run_mode.strip().lower() if run_mode else "saved_only"
         self.discover_max = max(1, int(discover_max)) if discover_max is not None else self.settings.discovery_max_results
+        self.metrics = RunMetricsTracker(base_dir=self.settings.base_dir, mode=self.run_mode)
         self.last_apply_note = ""
 
     def run(self) -> None:
@@ -141,6 +150,7 @@ class LinkedInJobApplier:
                     else:
                         effective_discover_max = min(self.discover_max, self.settings.discovery_max_results)
                         summary = self._run_discovery_pipeline(page, max_results=effective_discover_max)
+                        self.metrics.record_discovery_summary(summary)
                         print(
                             "Discovery summary: "
                             f"queries={summary['queries']}, discovered={summary['discovered']}, "
@@ -161,15 +171,28 @@ class LinkedInJobApplier:
                     print("No queued jobs to process for current mode.")
                     return
 
+                self.metrics.set_queue_context(
+                    selected_count=len(queue_urls),
+                    sources=queue_sources,
+                )
                 print(f"Queued jobs selected: {len(queue_urls)}")
                 processed = 0
                 for job_url in queue_urls:
                     processed += 1
                     print(f"\n[{processed}] Processing: {job_url}")
+                    queued_record = self.job_queue.get_record(job_url) or {}
+                    queue_source = str(queued_record.get("source", "")).strip().lower() or "unknown"
+                    started_monotonic = time.perf_counter()
+                    self.metrics.start_job(
+                        job_url=job_url,
+                        source=queue_source,
+                        started_monotonic=started_monotonic,
+                    )
                     self.job_queue.mark_in_progress(job_url)
                     context, page = self._recover_page_or_context(playwright, context, page)
                     if context is None or page is None:
                         print("Session recovery failed before processing. Stopping.")
+                        self._record_metrics_job_completion(job_url=job_url, ended_monotonic=time.perf_counter())
                         return
 
                     attempt = 0
@@ -178,6 +201,7 @@ class LinkedInJobApplier:
                         try:
                             self._process_single_job(page, context, job_url)
                             self._sync_job_queue_with_application_record(job_url)
+                            self._record_metrics_job_completion(job_url=job_url, ended_monotonic=time.perf_counter())
                             break
                         except Exception as exc:
                             if self._is_target_closed_exception(exc):
@@ -207,12 +231,16 @@ class LinkedInJobApplier:
                                 )
                             )
                             self._sync_job_queue_with_application_record(job_url)
+                            self._record_metrics_job_completion(job_url=job_url, ended_monotonic=time.perf_counter())
                             context, page = self._recover_page_or_context(playwright, context, page)
                             if context is None or page is None:
                                 print("Session recovery failed after error. Stopping.")
                                 return
                             break
             finally:
+                report_path = self.metrics.finalize_and_save()
+                if report_path:
+                    print(f"Metrics report: {report_path}")
                 try:
                     context.close()
                 except Exception:
@@ -515,6 +543,25 @@ class LinkedInJobApplier:
     def _sync_job_queue_with_application_record(self, job_url: str) -> None:
         record = self.knowledge.get_application_record(job_url)
         self.job_queue.sync_from_application_record(job_url, record)
+
+    def _record_metrics_job_completion(self, *, job_url: str, ended_monotonic: float) -> None:
+        record = self.knowledge.get_application_record(job_url)
+        if not isinstance(record, dict):
+            self.metrics.finish_job(
+                job_url=job_url,
+                status="unknown",
+                notes="missing_application_record",
+                ended_monotonic=ended_monotonic,
+            )
+            return
+        status = str(record.get("status", "")).strip().lower() or "unknown"
+        notes = str(record.get("notes", "")).strip()
+        self.metrics.finish_job(
+            job_url=job_url,
+            status=status,
+            notes=notes,
+            ended_monotonic=ended_monotonic,
+        )
 
     def _process_single_job(self, page: Page, context: BrowserContext, job_url: str) -> None:
         self.last_apply_note = ""
@@ -2243,6 +2290,7 @@ class LinkedInJobApplier:
         snapshot_path = self._save_stuck_html_snapshot(job=job, stage=stage, raw_html=raw_html)
         if snapshot_path is not None:
             print(f"[Copilot] Stuck HTML snapshot: {snapshot_path}")
+        self.metrics.record_fallback_trigger(stage=stage)
         outcome = self.agentic_fallback.run(
             page=page,
             root=root,
@@ -2255,6 +2303,12 @@ class LinkedInJobApplier:
         )
         if outcome.trace_path:
             print(f"[Copilot] Agentic trace: {outcome.trace_path}")
+        self.metrics.record_fallback_outcome(
+            stage=stage,
+            result=outcome.result,
+            playbook_source=outcome.playbook_source,
+            tool_steps_used=outcome.tool_steps_used,
+        )
         if state_signature and outcome.playbook_steps:
             if outcome.playbook_source == "memory":
                 if outcome.playbook_fingerprint:
@@ -2366,6 +2420,7 @@ class LinkedInJobApplier:
             before_fingerprint = self._snapshot_fingerprint(before_snapshot)
         before_url = page.url
         events_cursor = self._interaction_cursor(page)
+        self.metrics.record_human_handoff(stage=stage, result="requested")
 
         print(f"[Copilot] Manual assistance needed ({stage}): {reason}")
         if validation_messages:

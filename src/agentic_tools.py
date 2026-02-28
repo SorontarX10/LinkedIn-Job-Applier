@@ -79,6 +79,10 @@ class AgenticToolExecutor:
         self._action_label_cache.clear()
         self._field_cache.clear()
 
+    @property
+    def steps_used(self) -> int:
+        return int(self._steps_used)
+
     def _consume_step(self, tool_name: str) -> ToolResult | None:
         if self._steps_used >= self.max_steps_per_session:
             return ToolResult(ok=False, tool=tool_name, error="Step limit exceeded in agentic tool session.")
