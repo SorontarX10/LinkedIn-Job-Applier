@@ -107,6 +107,8 @@ class LinkedInJobApplier:
             blocked_action_tokens=self.settings.agentic_blocked_action_tokens,
             playbook_confidence_threshold=self.settings.agentic_playbook_confidence_threshold,
             playbook_min_uses=self.settings.agentic_playbook_min_uses,
+            llm_plan_enabled=self.settings.agentic_llm_plan_enabled,
+            llm_plan_max_steps=self.settings.agentic_llm_plan_max_steps,
         )
         self.job_queue = JobQueueStore(
             self.settings.job_queue_path,

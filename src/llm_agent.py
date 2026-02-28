@@ -374,6 +374,120 @@ class LLMJobAgent:
             recent_actions=recent_actions or [],
         )
 
+    def plan_stuck_tool_sequence(
+        self,
+        job: JobPosting,
+        page_url: str,
+        stage: str,
+        candidates: list[dict[str, str]],
+        visible_fields: list[dict[str, Any]] | None = None,
+        validation_messages: list[str] | None = None,
+        page_signals: dict[str, Any] | None = None,
+        recent_actions: list[str] | None = None,
+        html_excerpt: str = "",
+        max_steps: int = 4,
+    ) -> tuple[list[dict[str, Any]], str, bool]:
+        if not self.enabled:
+            return [], "", False
+
+        allowed_tools = {
+            "click_action",
+            "type_into_field",
+            "select_option",
+            "set_checkbox",
+            "set_file_input",
+            "wait",
+            "scroll",
+            "fill_visible_fields",
+            "human_handoff",
+        }
+        steps_cap = max(1, min(10, int(max_steps)))
+
+        system_prompt = (
+            "You are a tool-planning controller for stuck form automation.\n"
+            "Return a short sequence of tool calls to unblock progress.\n"
+            "Use only allowed tools and only IDs/labels provided in candidates/visible_fields.\n"
+            "Prioritize truthful form completion and safe progression.\n"
+            "If captcha/login or high uncertainty, choose human handoff.\n"
+            "Avoid close/cancel/discard/delete/logout actions.\n"
+            "Return JSON only."
+        )
+        user_payload = {
+            "job": {"title": job.title, "company": job.company, "url": job.url},
+            "page": {"url": page_url, "stage": stage},
+            "candidates": candidates[:40],
+            "visible_fields": (visible_fields or [])[:80],
+            "validation_messages": (validation_messages or [])[:12],
+            "page_signals": page_signals or {},
+            "recent_actions": (recent_actions or [])[-10:],
+            "html_excerpt": html_excerpt[:32000],
+            "allowed_tools": sorted(allowed_tools),
+            "max_steps": steps_cap,
+            "output_format": {
+                "decision": "execute | wait_human | fallback",
+                "reason": "short string",
+                "steps": [
+                    {
+                        "tool": "allowed tool name",
+                        "payload": {"tool specific payload": "value"},
+                    }
+                ],
+            },
+        }
+
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0.1,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                ],
+            )
+            raw = completion.choices[0].message.content or "{}"
+            data = self._safe_json(raw)
+        except Exception:
+            return [], "", False
+
+        decision = str(data.get("decision", "")).strip().lower()
+        reason = str(data.get("reason", "")).strip()[:240]
+        if decision == "wait_human":
+            return [], reason, True
+        if decision != "execute":
+            return [], reason, False
+
+        raw_steps = data.get("steps")
+        if not isinstance(raw_steps, list):
+            return [], reason, False
+
+        planned_steps: list[dict[str, Any]] = []
+        for step in raw_steps[:steps_cap]:
+            if not isinstance(step, dict):
+                continue
+            tool = str(step.get("tool", "")).strip().lower()
+            if tool not in allowed_tools:
+                continue
+            payload = step.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+            sanitized_payload: dict[str, Any] = {}
+            for key, value in payload.items():
+                key_text = str(key).strip()[:80]
+                if not key_text:
+                    continue
+                if isinstance(value, (str, int, float, bool)):
+                    sanitized_payload[key_text] = value
+                else:
+                    sanitized_payload[key_text] = str(value)[:220]
+            planned_steps.append(
+                {
+                    "tool": tool,
+                    "payload": sanitized_payload,
+                }
+            )
+        return planned_steps, reason, False
+
     def propose_form_answers(
         self,
         job: JobPosting,

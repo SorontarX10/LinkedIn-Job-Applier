@@ -114,7 +114,9 @@ Queue retry env controls (`.env`):
   - `discovery_only`: find/rank jobs and write to queue, no application step.
   - `discovery_and_apply`: combine saved sync + discovery, then apply from queue.
   - discovery modes require `DISCOVERY_ENABLED=true`.
-- `AGENTIC_FALLBACK_MAX_ITERATIONS`, `AGENTIC_TOOL_STEP_LIMIT`, `AGENTIC_TOOL_TIMEOUT_SEC` tune LLM tool fallback limits.
+- `AGENTIC_FALLBACK_MAX_ITERATIONS`, `AGENTIC_TOOL_STEP_LIMIT`, `AGENTIC_TOOL_TIMEOUT_SEC` tune LLM tool fallback limits (defaults now increased for harder forms).
+- `AGENTIC_LLM_PLAN_ENABLED=true` lets LLM propose short multi-step tool sequences (not only single-click strategy).
+- `AGENTIC_LLM_PLAN_MAX_STEPS` controls max tool calls in one LLM plan.
 - `AGENTIC_BLOCKED_ACTION_TOKENS` is a safety blacklist for risky button labels in agentic click fallback.
 - `AGENTIC_PLAYBOOK_CONFIDENCE_THRESHOLD` and `AGENTIC_PLAYBOOK_MIN_USES` control when memorized playbooks can auto-run.
 - `JOB_QUEUE_RETRY_LIMIT` and `JOB_QUEUE_RETRY_COOLDOWN_MINUTES` prevent retry storms for failing postings.

@@ -86,6 +86,8 @@ class Settings:
     agentic_blocked_action_tokens: tuple[str, ...]
     agentic_playbook_confidence_threshold: float
     agentic_playbook_min_uses: int
+    agentic_llm_plan_enabled: bool
+    agentic_llm_plan_max_steps: int
     discovery_enabled: bool
     discovery_keywords_include: tuple[str, ...]
     discovery_keywords_exclude: tuple[str, ...]
@@ -135,9 +137,9 @@ def load_settings() -> Settings:
     copilot_wait_timeout_sec = max(10, int(os.getenv("COPILOT_WAIT_TIMEOUT_SEC", "240")))
     copilot_poll_interval_ms = max(200, int(os.getenv("COPILOT_POLL_INTERVAL_MS", "900")))
     copilot_auto_skip_on_timeout = _to_bool(os.getenv("COPILOT_AUTO_SKIP_ON_TIMEOUT"), default=True)
-    agentic_fallback_max_iterations = max(1, int(os.getenv("AGENTIC_FALLBACK_MAX_ITERATIONS", "4")))
-    agentic_tool_step_limit = max(4, int(os.getenv("AGENTIC_TOOL_STEP_LIMIT", "32")))
-    agentic_tool_timeout_sec = max(20, int(os.getenv("AGENTIC_TOOL_TIMEOUT_SEC", "120")))
+    agentic_fallback_max_iterations = max(1, int(os.getenv("AGENTIC_FALLBACK_MAX_ITERATIONS", "8")))
+    agentic_tool_step_limit = max(4, int(os.getenv("AGENTIC_TOOL_STEP_LIMIT", "96")))
+    agentic_tool_timeout_sec = max(20, int(os.getenv("AGENTIC_TOOL_TIMEOUT_SEC", "240")))
     blocked_raw = os.getenv(
         "AGENTIC_BLOCKED_ACTION_TOKENS",
         "discard,close application,withdraw,delete,remove,logout,log out,sign out,cancel application",
@@ -151,6 +153,8 @@ def load_settings() -> Settings:
         agentic_playbook_confidence_threshold = 0.60
     agentic_playbook_confidence_threshold = max(0.0, min(1.0, agentic_playbook_confidence_threshold))
     agentic_playbook_min_uses = max(1, int(os.getenv("AGENTIC_PLAYBOOK_MIN_USES", "1")))
+    agentic_llm_plan_enabled = _to_bool(os.getenv("AGENTIC_LLM_PLAN_ENABLED"), default=True)
+    agentic_llm_plan_max_steps = max(1, min(10, int(os.getenv("AGENTIC_LLM_PLAN_MAX_STEPS", "4"))))
     discovery_enabled = _to_bool(os.getenv("DISCOVERY_ENABLED"), default=False)
     discovery_keywords_include = _to_list(os.getenv("DISCOVERY_KEYWORDS_INCLUDE", ""))
     discovery_keywords_exclude = _to_list(os.getenv("DISCOVERY_KEYWORDS_EXCLUDE", ""))
@@ -208,6 +212,8 @@ def load_settings() -> Settings:
         agentic_blocked_action_tokens=agentic_blocked_action_tokens,
         agentic_playbook_confidence_threshold=agentic_playbook_confidence_threshold,
         agentic_playbook_min_uses=agentic_playbook_min_uses,
+        agentic_llm_plan_enabled=agentic_llm_plan_enabled,
+        agentic_llm_plan_max_steps=agentic_llm_plan_max_steps,
         discovery_enabled=discovery_enabled,
         discovery_keywords_include=discovery_keywords_include,
         discovery_keywords_exclude=discovery_keywords_exclude,

@@ -37,12 +37,14 @@ class AgenticFallbackController:
         knowledge: KnowledgeStore,
         base_dir: Path,
         *,
-        max_iterations: int = 4,
-        tool_step_limit: int = 32,
-        tool_timeout_sec: int = 120,
+        max_iterations: int = 8,
+        tool_step_limit: int = 96,
+        tool_timeout_sec: int = 240,
         blocked_action_tokens: tuple[str, ...] | None = None,
         playbook_confidence_threshold: float = 0.60,
         playbook_min_uses: int = 1,
+        llm_plan_enabled: bool = True,
+        llm_plan_max_steps: int = 4,
     ) -> None:
         self.llm = llm
         self.knowledge = knowledge
@@ -50,6 +52,8 @@ class AgenticFallbackController:
         self.max_iterations = max(1, int(max_iterations))
         self.playbook_confidence_threshold = max(0.0, min(1.0, float(playbook_confidence_threshold)))
         self.playbook_min_uses = max(1, int(playbook_min_uses))
+        self.llm_plan_enabled = bool(llm_plan_enabled)
+        self.llm_plan_max_steps = max(1, min(10, int(llm_plan_max_steps)))
         self.executor = AgenticToolExecutor(
             max_steps_per_session=max(4, int(tool_step_limit)),
             max_session_seconds=max(20, int(tool_timeout_sec)),
@@ -106,6 +110,58 @@ class AgenticFallbackController:
             validation_messages = self._as_str_list(validation_res.data.get("messages")) if validation_res.ok else []
             page_signals = self._build_page_signals(signal_res.data if signal_res.ok else {}, visible_fields, validation_messages)
             html_excerpt = str(snapshot_res.data.get("html_excerpt", "")).strip() if snapshot_res.ok else ""
+
+            if self.llm_plan_enabled:
+                plan_steps, plan_reason, plan_wait_human = self.llm.plan_stuck_tool_sequence(
+                    job=job,
+                    page_url=page.url,
+                    stage=stage,
+                    candidates=candidates,
+                    visible_fields=visible_fields,
+                    validation_messages=validation_messages,
+                    page_signals=page_signals,
+                    recent_actions=action_history or [],
+                    html_excerpt=html_excerpt,
+                    max_steps=self.llm_plan_max_steps,
+                )
+                if plan_wait_human:
+                    trace.append(
+                        {
+                            "iteration": iteration + 1,
+                            "source": "llm_plan",
+                            "decision": "wait_human",
+                            "reason": plan_reason,
+                        }
+                    )
+                    playbook_steps.append({"tool": "human_handoff", "payload": {}})
+                    trace_path = self._save_trace(job=job, stage=stage, trace=trace)
+                    return AgenticFallbackOutcome(
+                        result="human",
+                        reason=plan_reason or "LLM requested human handoff.",
+                        trace_path=str(trace_path) if trace_path else "",
+                        playbook_steps=playbook_steps,
+                        playbook_source="llm",
+                        tool_steps_used=self.executor.steps_used,
+                    )
+                if plan_steps:
+                    plan_outcome = self._execute_llm_plan(
+                        page=page,
+                        helper=helper,
+                        iteration=iteration + 1,
+                        plan_steps=plan_steps,
+                        candidates=candidates,
+                        visible_fields=visible_fields,
+                        plan_reason=plan_reason,
+                        trace=trace,
+                    )
+                    playbook_steps.extend(plan_steps)
+                    if plan_outcome is not None:
+                        trace_path = self._save_trace(job=job, stage=stage, trace=trace)
+                        plan_outcome.trace_path = str(trace_path) if trace_path else ""
+                        plan_outcome.playbook_steps = playbook_steps
+                        plan_outcome.playbook_source = "llm"
+                        plan_outcome.tool_steps_used = self.executor.steps_used
+                        return plan_outcome
 
             strategy, button_id, reason = self.llm.choose_stuck_strategy(
                 job=job,
@@ -238,6 +294,141 @@ class AgenticFallbackController:
             playbook_source="llm",
             tool_steps_used=self.executor.steps_used,
         )
+
+    def _execute_llm_plan(
+        self,
+        *,
+        page: Page,
+        helper: FormHelper | None,
+        iteration: int,
+        plan_steps: list[dict[str, Any]],
+        candidates: list[dict[str, Any]],
+        visible_fields: list[dict[str, Any]],
+        plan_reason: str,
+        trace: list[dict[str, Any]],
+    ) -> AgenticFallbackOutcome | None:
+        clicked_label = ""
+        mutated = False
+        wait_human = False
+
+        for step_index, step in enumerate(plan_steps, start=1):
+            tool = str(step.get("tool", "")).strip().lower()
+            payload = step.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+
+            if tool == "human_handoff":
+                wait_human = True
+                trace.append(
+                    {
+                        "iteration": iteration,
+                        "source": "llm_plan",
+                        "step_index": step_index,
+                        "tool": tool,
+                        "ok": True,
+                        "reason": plan_reason,
+                    }
+                )
+                break
+
+            if tool == "fill_visible_fields":
+                try:
+                    if helper is not None:
+                        helper.fill_visible_fields(page)
+                    mutated = True
+                    trace.append(
+                        {
+                            "iteration": iteration,
+                            "source": "llm_plan",
+                            "step_index": step_index,
+                            "tool": tool,
+                            "ok": True,
+                        }
+                    )
+                except Exception as exc:
+                    trace.append(
+                        {
+                            "iteration": iteration,
+                            "source": "llm_plan",
+                            "step_index": step_index,
+                            "tool": tool,
+                            "ok": False,
+                            "error": str(exc),
+                        }
+                    )
+                    break
+                continue
+
+            normalized_payload = dict(payload)
+            if tool == "click_action":
+                action_id = self._resolve_action_id(candidates, payload)
+                if action_id is None:
+                    trace.append(
+                        {
+                            "iteration": iteration,
+                            "source": "llm_plan",
+                            "step_index": step_index,
+                            "tool": tool,
+                            "ok": False,
+                            "error": "No matching action id.",
+                        }
+                    )
+                    break
+                normalized_payload = {"candidate_id": int(action_id)}
+            elif tool in {"type_into_field", "select_option", "set_checkbox", "set_file_input"}:
+                field_id = self._resolve_field_id(visible_fields, payload)
+                if field_id is None:
+                    trace.append(
+                        {
+                            "iteration": iteration,
+                            "source": "llm_plan",
+                            "step_index": step_index,
+                            "tool": tool,
+                            "ok": False,
+                            "error": "No matching field id.",
+                        }
+                    )
+                    break
+                normalized_payload["field_id"] = int(field_id)
+
+            step_result = self.executor.execute(tool, page=page, **normalized_payload)
+            trace.append(
+                {
+                    "iteration": iteration,
+                    "source": "llm_plan",
+                    "step_index": step_index,
+                    "tool": tool,
+                    "ok": step_result.ok,
+                    "error": step_result.error,
+                    "payload": normalized_payload,
+                }
+            )
+            if not step_result.ok:
+                break
+
+            if tool == "click_action":
+                clicked_label = str(step_result.data.get("label", "")).strip()
+                mutated = True
+            elif tool in {"type_into_field", "select_option", "set_checkbox", "set_file_input", "scroll"}:
+                mutated = True
+
+        if wait_human:
+            return AgenticFallbackOutcome(
+                result="human",
+                reason=plan_reason or "LLM requested human handoff in tool plan.",
+            )
+        if clicked_label:
+            return AgenticFallbackOutcome(
+                result="clicked",
+                reason=plan_reason or "LLM tool plan executed click action.",
+                clicked_label=clicked_label,
+            )
+        if mutated:
+            return AgenticFallbackOutcome(
+                result="retry",
+                reason=plan_reason or "LLM tool plan changed form state.",
+            )
+        return None
 
     def _try_memory_playbooks(
         self,
@@ -445,6 +636,8 @@ class AgenticFallbackController:
     @staticmethod
     def _resolve_action_id(actions: list[dict[str, Any]], payload: dict[str, Any]) -> int | None:
         requested_label = str(payload.get("label", "")).strip()
+        if not requested_label:
+            requested_label = str(payload.get("candidate_label", "")).strip()
         requested_id_raw = payload.get("candidate_id")
         requested_id = None
         try:
@@ -473,6 +666,39 @@ class AgenticFallbackController:
                     continue
                 if action_id == requested_id:
                     return action_id
+        return None
+
+    @staticmethod
+    def _resolve_field_id(fields: list[dict[str, Any]], payload: dict[str, Any]) -> int | None:
+        requested_id_raw = payload.get("field_id")
+        requested_id = None
+        try:
+            requested_id = int(requested_id_raw)
+        except Exception:
+            requested_id = None
+
+        requested_label = str(payload.get("field_label", "")).strip()
+        if requested_label:
+            requested_norm = re.sub(r"\s+", " ", requested_label).strip().lower()
+            for field in fields:
+                try:
+                    field_id = int(field.get("id", -1))
+                except Exception:
+                    continue
+                label = str(field.get("label", "")).strip().lower()
+                if not label:
+                    continue
+                if requested_norm == label or requested_norm in label or label in requested_norm:
+                    return field_id
+
+        if requested_id is not None:
+            for field in fields:
+                try:
+                    field_id = int(field.get("id", -1))
+                except Exception:
+                    continue
+                if field_id == requested_id:
+                    return field_id
         return None
 
     @staticmethod

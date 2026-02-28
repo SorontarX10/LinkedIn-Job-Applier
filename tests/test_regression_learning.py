@@ -12,6 +12,33 @@ from src.models import JobPosting
 
 
 class _StubLLM:
+    def plan_stuck_tool_sequence(
+        self,
+        job: JobPosting,
+        page_url: str,
+        stage: str,
+        candidates,
+        visible_fields=None,
+        validation_messages=None,
+        page_signals=None,
+        recent_actions=None,
+        html_excerpt: str = "",
+        max_steps: int = 4,
+    ):
+        del (
+            job,
+            page_url,
+            stage,
+            candidates,
+            visible_fields,
+            validation_messages,
+            page_signals,
+            recent_actions,
+            html_excerpt,
+            max_steps,
+        )
+        return [], "", False
+
     def choose_stuck_strategy(
         self,
         job: JobPosting,

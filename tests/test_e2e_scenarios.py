@@ -92,6 +92,8 @@ def _make_settings(base_dir: Path) -> Settings:
         agentic_blocked_action_tokens=("discard", "delete"),
         agentic_playbook_confidence_threshold=0.6,
         agentic_playbook_min_uses=1,
+        agentic_llm_plan_enabled=True,
+        agentic_llm_plan_max_steps=4,
         discovery_enabled=True,
         discovery_keywords_include=("agentic ai", "python"),
         discovery_keywords_exclude=("onsite only",),
