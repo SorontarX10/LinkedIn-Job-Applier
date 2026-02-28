@@ -22,6 +22,7 @@ from src.job_queue import JobQueueStore
 from src.knowledge_store import KnowledgeStore
 from src.llm_agent import LLMJobAgent
 from src.models import ApplicationRecord, FitDecision, JobPosting
+from src.operation_history import OperationHistoryTracker
 from src.run_metrics import RunMetricsTracker
 
 
@@ -121,14 +122,27 @@ class LinkedInJobApplier:
         )
         self.run_mode = run_mode.strip().lower() if run_mode else "saved_only"
         self.discover_max = max(1, int(discover_max)) if discover_max is not None else self.settings.discovery_max_results
+        self.operations = OperationHistoryTracker(base_dir=self.settings.base_dir, mode=self.run_mode)
         self.metrics = RunMetricsTracker(base_dir=self.settings.base_dir, mode=self.run_mode)
         self.last_apply_note = ""
 
     def run(self) -> None:
         allowed_modes = {"saved_only", "discovery_only", "discovery_and_apply"}
         mode = self.run_mode if self.run_mode in allowed_modes else "saved_only"
+        self._log_operation(
+            "run_started",
+            requested_mode=self.run_mode,
+            effective_mode=mode,
+            max_jobs_per_run=self.settings.max_jobs_per_run,
+            min_fit_score=self.settings.min_fit_score,
+            copilot_mode=self.settings.copilot_mode,
+            terminal_input_enabled=self.settings.terminal_input_enabled,
+            discovery_enabled=self.settings.discovery_enabled,
+            agentic_primary_after_apply=self.settings.agentic_primary_after_apply,
+        )
         if mode != self.run_mode:
             print(f"Unknown run mode '{self.run_mode}'. Falling back to 'saved_only'.")
+            self._log_operation("run_mode_fallback", requested_mode=self.run_mode, effective_mode=mode)
 
         with sync_playwright() as playwright:
             context = self._launch_context(playwright)
@@ -136,23 +150,34 @@ class LinkedInJobApplier:
                 page = context.pages[0] if context.pages else context.new_page()
                 if not self._ensure_logged_in(page):
                     print("Cannot continue without active LinkedIn session.")
+                    self._log_operation("run_stopped", reason="linkedin_login_missing")
                     return
 
                 if mode in {"saved_only", "discovery_and_apply"}:
                     saved_urls = self._sync_saved_jobs_into_queue(page)
                     if mode == "saved_only" and not saved_urls:
+                        self._log_operation("run_stopped", reason="no_saved_jobs")
                         return
 
                 discovery_enabled_for_run = self.settings.discovery_enabled
                 if mode in {"discovery_only", "discovery_and_apply"}:
                     if not discovery_enabled_for_run:
                         print("Discovery is disabled (`DISCOVERY_ENABLED=false`).")
+                        self._log_operation("discovery_disabled_for_mode", mode=mode)
                         if mode == "discovery_only":
+                            self._log_operation("run_stopped", reason="discovery_disabled")
                             return
                     else:
                         effective_discover_max = min(self.discover_max, self.settings.discovery_max_results)
                         summary = self._run_discovery_pipeline(page, max_results=effective_discover_max)
                         self.metrics.record_discovery_summary(summary)
+                        self._log_operation(
+                            "discovery_summary",
+                            queries=summary.get("queries", 0),
+                            discovered=summary.get("discovered", 0),
+                            queued=summary.get("queued", 0),
+                            rejected=summary.get("rejected", 0),
+                        )
                         print(
                             "Discovery summary: "
                             f"queries={summary['queries']}, discovered={summary['discovered']}, "
@@ -160,6 +185,7 @@ class LinkedInJobApplier:
                         )
                     if mode == "discovery_only":
                         print("Discovery-only mode completed (no apply phase).")
+                        self._log_operation("run_completed", detail="discovery_only")
                         return
 
                 queue_sources = {"saved"}
@@ -171,6 +197,7 @@ class LinkedInJobApplier:
                 )
                 if not queue_urls:
                     print("No queued jobs to process for current mode.")
+                    self._log_operation("run_stopped", reason="empty_queue", queue_sources=sorted(queue_sources))
                     return
 
                 self.metrics.set_queue_context(
@@ -178,12 +205,23 @@ class LinkedInJobApplier:
                     sources=queue_sources,
                 )
                 print(f"Queued jobs selected: {len(queue_urls)}")
+                self._log_operation(
+                    "queue_selected",
+                    selected_count=len(queue_urls),
+                    queue_sources=sorted(queue_sources),
+                )
                 processed = 0
                 for job_url in queue_urls:
                     processed += 1
                     print(f"\n[{processed}] Processing: {job_url}")
                     queued_record = self.job_queue.get_record(job_url) or {}
                     queue_source = str(queued_record.get("source", "")).strip().lower() or "unknown"
+                    self._log_operation(
+                        "job_processing_started",
+                        index=processed,
+                        queue_source=queue_source,
+                        job_url=job_url,
+                    )
                     started_monotonic = time.perf_counter()
                     self.metrics.start_job(
                         job_url=job_url,
@@ -194,6 +232,7 @@ class LinkedInJobApplier:
                     context, page = self._recover_page_or_context(playwright, context, page)
                     if context is None or page is None:
                         print("Session recovery failed before processing. Stopping.")
+                        self._log_operation("run_stopped", reason="session_recovery_failed_before_job", job_url=job_url)
                         self._record_metrics_job_completion(job_url=job_url, ended_monotonic=time.perf_counter())
                         return
 
@@ -204,18 +243,38 @@ class LinkedInJobApplier:
                             self._process_single_job(page, context, job_url)
                             self._sync_job_queue_with_application_record(job_url)
                             self._record_metrics_job_completion(job_url=job_url, ended_monotonic=time.perf_counter())
+                            self._log_operation(
+                                "job_processing_completed",
+                                job_url=job_url,
+                                attempt=attempt,
+                            )
                             break
                         except Exception as exc:
                             if self._is_target_closed_exception(exc):
                                 print("Detected closed target/page during processing. Attempting recovery...")
+                                self._log_operation(
+                                    "job_target_closed_detected",
+                                    job_url=job_url,
+                                    attempt=attempt,
+                                )
                                 recovered_context, recovered_page = self._recover_page_or_context(playwright, context, page)
                                 if recovered_context is None or recovered_page is None:
                                     print("TargetClosed recovery failed. Stopping.")
+                                    self._log_operation(
+                                        "run_stopped",
+                                        reason="target_closed_recovery_failed",
+                                        job_url=job_url,
+                                    )
                                     return
                                 context = recovered_context
                                 page = recovered_page
                                 if attempt < 2:
                                     print("Recovered browser state. Retrying current job once.")
+                                    self._log_operation(
+                                        "job_retry_after_recovery",
+                                        job_url=job_url,
+                                        attempt=attempt,
+                                    )
                                     continue
 
                             error_name = type(exc).__name__
@@ -223,6 +282,13 @@ class LinkedInJobApplier:
                             if len(error_text) > 180:
                                 error_text = f"{error_text[:177]}..."
                             print(f"Error while processing {job_url}: {error_name}: {error_text}")
+                            self._log_operation(
+                                "job_processing_error",
+                                job_url=job_url,
+                                attempt=attempt,
+                                error_name=error_name,
+                                error_text=error_text,
+                            )
                             self.knowledge.save_application(
                                 ApplicationRecord(
                                     url=job_url,
@@ -237,28 +303,65 @@ class LinkedInJobApplier:
                             context, page = self._recover_page_or_context(playwright, context, page)
                             if context is None or page is None:
                                 print("Session recovery failed after error. Stopping.")
+                                self._log_operation(
+                                    "run_stopped",
+                                    reason="session_recovery_failed_after_job_error",
+                                    job_url=job_url,
+                                )
                                 return
                             break
             finally:
                 report_path = self.metrics.finalize_and_save()
                 if report_path:
                     print(f"Metrics report: {report_path}")
+                    self._log_operation("metrics_report_saved", path=str(report_path))
+                self.operations.finalize(metrics_report_path=str(report_path) if report_path else "")
                 try:
                     context.close()
                 except Exception:
                     pass
 
+    def _log_operation(self, event: str, **data: Any) -> None:
+        try:
+            self.operations.log(event, **data)
+        except Exception:
+            pass
+
+    def _recent_operation_context(self, limit: int = 25) -> list[dict[str, str | int]]:
+        recent = self.operations.recent(limit=limit)
+        compact: list[dict[str, str | int]] = []
+        for item in recent:
+            compact.append(
+                {
+                    "seq": int(item.get("seq", 0)) if str(item.get("seq", "")).strip() else 0,
+                    "event": str(item.get("event", "")).strip()[:80],
+                    "stage": str(item.get("stage", "")).strip()[:120],
+                    "job_url": str(item.get("job_url", "")).strip()[:220],
+                    "status": str(item.get("status", "")).strip()[:40],
+                    "result": str(item.get("result", "")).strip()[:40],
+                    "reason": str(item.get("reason", "")).strip()[:220],
+                }
+            )
+        return compact
+
     def _sync_saved_jobs_into_queue(self, page: Page) -> list[str]:
         job_urls = self._get_saved_job_urls(page)
         if not job_urls:
             print("No saved jobs found.")
+            self._log_operation("saved_jobs_empty")
             return []
 
         queued_count = self.job_queue.enqueue_saved_jobs(job_urls)
         if queued_count:
             print(f"Job queue synchronized from saved jobs: {queued_count} entries updated.")
+            self._log_operation(
+                "saved_jobs_synchronized",
+                queued_updated=queued_count,
+                total_saved=len(job_urls),
+            )
 
         print(f"Saved jobs detected: {len(job_urls)}")
+        self._log_operation("saved_jobs_detected", count=len(job_urls))
         return job_urls
 
     def _run_discovery_pipeline(self, page: Page, max_results: int) -> dict[str, int]:
@@ -545,6 +648,14 @@ class LinkedInJobApplier:
     def _sync_job_queue_with_application_record(self, job_url: str) -> None:
         record = self.knowledge.get_application_record(job_url)
         self.job_queue.sync_from_application_record(job_url, record)
+        status = ""
+        if isinstance(record, dict):
+            status = str(record.get("status", "")).strip().lower()
+        self._log_operation(
+            "job_queue_synced_from_record",
+            job_url=job_url,
+            status=status or "unknown",
+        )
 
     def _record_metrics_job_completion(self, *, job_url: str, ended_monotonic: float) -> None:
         record = self.knowledge.get_application_record(job_url)
@@ -555,6 +666,10 @@ class LinkedInJobApplier:
                 notes="missing_application_record",
                 ended_monotonic=ended_monotonic,
             )
+            self._log_operation(
+                "job_completion_record_missing",
+                job_url=job_url,
+            )
             return
         status = str(record.get("status", "")).strip().lower() or "unknown"
         notes = str(record.get("notes", "")).strip()
@@ -564,9 +679,16 @@ class LinkedInJobApplier:
             notes=notes,
             ended_monotonic=ended_monotonic,
         )
+        self._log_operation(
+            "job_completion_recorded",
+            job_url=job_url,
+            status=status,
+            notes=notes,
+        )
 
     def _process_single_job(self, page: Page, context: BrowserContext, job_url: str) -> None:
         self.last_apply_note = ""
+        self._log_operation("job_flow_entered", job_url=job_url)
         if self.settings.skip_already_applied:
             record = self.knowledge.get_application_record(job_url)
             previous_status = str(record.get("status", "")).strip().lower() if isinstance(record, dict) else ""
@@ -575,16 +697,28 @@ class LinkedInJobApplier:
                 if self._unsave_job(page, job_url):
                     print("Already applied job was removed from saved list.")
                 print("Skipped: already submitted before.")
+                self._log_operation("job_skipped", job_url=job_url, reason="already_submitted")
                 return
 
             if previous_status == "not_submitted":
                 print("Requeued: previous attempt was not_submitted, retrying now.")
+                self._log_operation("job_requeued", job_url=job_url, previous_status=previous_status)
 
             elif previous_status:
                 print(f"Skipped: already processed before (status={previous_status}).")
+                self._log_operation("job_skipped", job_url=job_url, reason="already_processed", previous_status=previous_status)
                 return
 
         job = self._read_job_posting(page, job_url)
+        self._log_operation(
+            "job_posting_loaded",
+            job_url=job.url,
+            job_id=job.job_id,
+            title=job.title,
+            company=job.company,
+            location=job.location,
+            apply_mode=job.apply_mode,
+        )
         if not job.description.strip():
             print("Skipped: missing job description.")
             self.knowledge.save_application(
@@ -596,11 +730,14 @@ class LinkedInJobApplier:
                     notes="missing_description",
                 )
             )
+            self._log_operation("job_skipped", job_url=job.url, reason="missing_description")
             return
         if job.apply_mode == "unknown" and self._find_easy_apply_trigger(page):
             job.apply_mode = "easy"
             print("Apply mode corrected to: easy")
+            self._log_operation("job_apply_mode_corrected", job_url=job.url, apply_mode=job.apply_mode)
         print(f"Apply mode detected: {job.apply_mode}")
+        self._log_operation("job_apply_mode_detected", job_url=job.url, apply_mode=job.apply_mode)
 
         decision = self.llm.analyze_job(
             job=job,
@@ -609,6 +746,13 @@ class LinkedInJobApplier:
             known_answers=self.knowledge.field_answers,
         )
         print(f"Fit score: {decision.fit_score}/100 | should_apply={decision.should_apply}")
+        self._log_operation(
+            "job_fit_evaluated",
+            job_url=job.url,
+            fit_score=decision.fit_score,
+            should_apply=decision.should_apply,
+            missing_information_count=len(decision.missing_information),
+        )
         if decision.reasoning:
             print(f"Reason: {decision.reasoning}")
 
@@ -625,6 +769,12 @@ class LinkedInJobApplier:
                     status="skipped_outside_poland",
                     notes=outside_reason or f"fit={decision.fit_score}",
                 )
+            )
+            self._log_operation(
+                "job_skipped",
+                job_url=job.url,
+                reason="outside_poland_requirement",
+                details=outside_reason or "",
             )
             return
 
@@ -657,6 +807,13 @@ class LinkedInJobApplier:
                     notes=f"fit={decision.fit_score}",
                 )
             )
+            self._log_operation(
+                "job_skipped",
+                job_url=job.url,
+                reason="below_fit_threshold",
+                fit_score=decision.fit_score,
+                min_fit_score=self.settings.min_fit_score,
+            )
             return
 
         if self.settings.dry_run:
@@ -670,20 +827,29 @@ class LinkedInJobApplier:
                     notes=f"mode={job.apply_mode}",
                 )
             )
+            self._log_operation("job_dry_run_ready", job_url=job.url, apply_mode=job.apply_mode)
             return
 
         submitted = False
+        self._log_operation(
+            "job_apply_attempt_started",
+            job_url=job.url,
+            apply_mode=job.apply_mode,
+            apply_external_forms=self.settings.apply_external_forms,
+        )
         if job.apply_mode == "easy":
             submitted = self._apply_easy(page, job, cover_letter_path, decision.prefilled_answers)
         elif job.apply_mode == "external" and self.settings.apply_external_forms:
             submitted = self._apply_external(context, page, job, cover_letter_path, decision.prefilled_answers)
         elif job.apply_mode == "unknown" and self.settings.apply_external_forms:
             print("Apply mode unknown. Trying Easy Apply first, then external/generic flow.")
+            self._log_operation("job_apply_mode_unknown_fallback", job_url=job.url)
             submitted = self._apply_easy(page, job, cover_letter_path, decision.prefilled_answers)
             if not submitted:
                 submitted = self._apply_external(context, page, job, cover_letter_path, decision.prefilled_answers)
         else:
             print("Skipped: unsupported apply mode.")
+            self._log_operation("job_apply_skipped_unsupported_mode", job_url=job.url, apply_mode=job.apply_mode)
 
         status = "submitted" if submitted else "not_submitted"
         notes = f"mode={job.apply_mode}"
@@ -701,6 +867,13 @@ class LinkedInJobApplier:
         if submitted and self._unsave_job(page, job.url):
             print("Submitted job was removed from saved list.")
         print(f"Application result: {status}")
+        self._log_operation(
+            "job_apply_result",
+            job_url=job.url,
+            status=status,
+            notes=notes,
+            apply_mode=job.apply_mode,
+        )
 
     def _read_job_posting(self, page: Page, job_url: str) -> JobPosting:
         self._goto_with_retries(page, job_url)
@@ -815,6 +988,7 @@ class LinkedInJobApplier:
         cover_letter_path: Path | None,
         prefilled_answers: dict[str, str],
     ) -> bool:
+        self._log_operation("easy_apply_flow_started", job_url=job.url, job_id=job.job_id)
         trigger = self._find_easy_apply_trigger(page)
         if not trigger and self.settings.copilot_mode:
             assist = self._await_human_assist(
@@ -833,6 +1007,7 @@ class LinkedInJobApplier:
                 return False
         if not trigger:
             print("Easy Apply button not found.")
+            self._log_operation("easy_apply_trigger_missing", job_url=job.url)
             return False
 
         try:
@@ -854,6 +1029,7 @@ class LinkedInJobApplier:
                     self.last_apply_note = "copilot_handoff_unavailable"
                     return False
             else:
+                self._log_operation("easy_apply_open_failed", job_url=job.url)
                 return False
         page.wait_for_timeout(1200)
 
@@ -877,40 +1053,8 @@ class LinkedInJobApplier:
 
             if self._easy_apply_success_detected(page):
                 self._close_any_dialog(page, modal_root)
+                self._log_operation("easy_apply_success", job_url=job.url, detail="initial_detection")
                 return True
-
-            repeated_action_before_step = self._repeated_action_tail(action_history)
-            allow_llm_click = repeated_action_before_step < 3
-            if allow_llm_click and self._click_llm_selected_action(
-                root=modal_root,
-                page=page,
-                job=job,
-                stage="linkedin_easy_apply_modal",
-                allow_plain_anchors=False,
-                helper=helper,
-                action_history=action_history,
-            ):
-                page.wait_for_timeout(1000)
-                if self._easy_apply_success_detected(page):
-                    self._close_any_dialog(page, modal_root)
-                    return True
-                continue
-
-            if self._click_action_with_confirmation(modal_root, self.SUBMIT_TOKENS, job):
-                self._append_action_history(action_history, "submit")
-                page.wait_for_timeout(1800)
-                if self._easy_apply_success_detected(page):
-                    self._close_any_dialog(page, modal_root)
-                    return True
-
-            if self._click_action(modal_root, self.REVIEW_TOKENS, ()):
-                self._append_action_history(action_history, "review")
-                page.wait_for_timeout(1000)
-                continue
-            if self._click_action(modal_root, self.NEXT_TOKENS, ()):
-                self._append_action_history(action_history, "next")
-                page.wait_for_timeout(1000)
-                continue
 
             validation_messages = self._collect_validation_messages(page)
             visible_fields = helper.collect_visible_fields_snapshot(page)
@@ -928,6 +1072,87 @@ class LinkedInJobApplier:
                 state_repeat_count = 1 if state_signature else 0
                 last_state_signature = state_signature
 
+            if self.settings.agentic_primary_after_apply:
+                primary_recovery = self._try_llm_stuck_recovery(
+                    page=page,
+                    job=job,
+                    stage="linkedin_easy_apply_modal",
+                    state_signature=state_signature,
+                    root=modal_root,
+                    allow_plain_anchors=False,
+                    helper=helper,
+                    action_history=action_history,
+                    is_primary_agentic=True,
+                )
+                if primary_recovery in {"clicked", "retry"}:
+                    page.wait_for_timeout(900)
+                    if self._easy_apply_success_detected(page):
+                        self._close_any_dialog(page, modal_root)
+                        self._log_operation("easy_apply_success", job_url=job.url, detail="primary_agentic")
+                        return True
+                    continue
+                if primary_recovery == "human":
+                    if manual_assists < 4:
+                        assist = self._await_human_assist(
+                            page=page,
+                            helper=helper,
+                            stage="linkedin_easy_apply_modal",
+                            reason="Primary agentic mode requested manual intervention.",
+                            validation_messages=validation_messages,
+                            state_signature=state_signature,
+                            action_candidates=candidates,
+                        )
+                        if assist == "resume":
+                            manual_assists += 1
+                            page.wait_for_timeout(700)
+                            if self._easy_apply_success_detected(page):
+                                self._close_any_dialog(page, modal_root)
+                                self._log_operation("easy_apply_success", job_url=job.url, detail="manual_resume_after_primary_agentic")
+                                return True
+                            continue
+                        if assist == "skip":
+                            self.last_apply_note = "copilot_manual_skip"
+                        else:
+                            self.last_apply_note = "copilot_handoff_unavailable"
+                    elif self.settings.copilot_mode and not self.last_apply_note:
+                        self.last_apply_note = "copilot_assist_limit_reached"
+                    break
+
+            repeated_action_before_step = self._repeated_action_tail(action_history)
+            allow_llm_click = repeated_action_before_step < 3
+            if allow_llm_click and self._click_llm_selected_action(
+                root=modal_root,
+                page=page,
+                job=job,
+                stage="linkedin_easy_apply_modal",
+                allow_plain_anchors=False,
+                helper=helper,
+                action_history=action_history,
+            ):
+                page.wait_for_timeout(1000)
+                if self._easy_apply_success_detected(page):
+                    self._close_any_dialog(page, modal_root)
+                    self._log_operation("easy_apply_success", job_url=job.url, detail="llm_click")
+                    return True
+                continue
+
+            if self._click_action_with_confirmation(modal_root, self.SUBMIT_TOKENS, job):
+                self._append_action_history(action_history, "submit")
+                page.wait_for_timeout(1800)
+                if self._easy_apply_success_detected(page):
+                    self._close_any_dialog(page, modal_root)
+                    self._log_operation("easy_apply_success", job_url=job.url, detail="submit_click")
+                    return True
+
+            if self._click_action(modal_root, self.REVIEW_TOKENS, ()):
+                self._append_action_history(action_history, "review")
+                page.wait_for_timeout(1000)
+                continue
+            if self._click_action(modal_root, self.NEXT_TOKENS, ()):
+                self._append_action_history(action_history, "next")
+                page.wait_for_timeout(1000)
+                continue
+
             if self._try_copilot_memory_action(
                 state_signature=state_signature,
                 candidates=candidates,
@@ -937,6 +1162,7 @@ class LinkedInJobApplier:
                 page.wait_for_timeout(900)
                 if self._easy_apply_success_detected(page):
                     self._close_any_dialog(page, modal_root)
+                    self._log_operation("easy_apply_success", job_url=job.url, detail="copilot_memory")
                     return True
                 continue
 
@@ -961,6 +1187,7 @@ class LinkedInJobApplier:
                     page.wait_for_timeout(900)
                     if self._easy_apply_success_detected(page):
                         self._close_any_dialog(page, modal_root)
+                        self._log_operation("easy_apply_success", job_url=job.url, detail="stuck_recovery")
                         return True
                     continue
                 if recovery == "human":
@@ -979,6 +1206,7 @@ class LinkedInJobApplier:
                             page.wait_for_timeout(700)
                             if self._easy_apply_success_detected(page):
                                 self._close_any_dialog(page, modal_root)
+                                self._log_operation("easy_apply_success", job_url=job.url, detail="manual_resume_after_stuck_recovery")
                                 return True
                             continue
                         if assist == "skip":
@@ -1004,6 +1232,7 @@ class LinkedInJobApplier:
                     page.wait_for_timeout(700)
                     if self._easy_apply_success_detected(page):
                         self._close_any_dialog(page, modal_root)
+                        self._log_operation("easy_apply_success", job_url=job.url, detail="manual_resume")
                         return True
                     continue
                 if assist == "skip":
@@ -1015,6 +1244,7 @@ class LinkedInJobApplier:
             break
 
         self._close_any_dialog(page, modal_root)
+        self._log_operation("easy_apply_failed", job_url=job.url, note=self.last_apply_note or "")
         return False
 
     def _apply_external(
@@ -1025,10 +1255,12 @@ class LinkedInJobApplier:
         cover_letter_path: Path | None,
         prefilled_answers: dict[str, str],
     ) -> bool:
+        self._log_operation("external_apply_flow_started", job_url=job.url, job_id=job.job_id)
         trigger = self._find_external_apply_trigger(page)
         external_page: Page | None = None
         if not trigger:
             print("External apply button not found. Trying to interact on current page.")
+            self._log_operation("external_apply_trigger_missing", job_url=job.url)
             if self.settings.copilot_mode:
                 assist = self._await_human_assist(
                     page=page,
@@ -1045,6 +1277,7 @@ class LinkedInJobApplier:
                     self.last_apply_note = "copilot_handoff_unavailable"
                     return False
             else:
+                self._log_operation("external_apply_open_failed", job_url=job.url, reason="trigger_missing")
                 return False
 
         opened_in_new_tab = False
@@ -1055,6 +1288,7 @@ class LinkedInJobApplier:
                 external_page = event_info.value
                 opened_in_new_tab = True
                 external_page.wait_for_load_state("domcontentloaded")
+                self._log_operation("external_apply_tab_opened", job_url=job.url, opened_in_new_tab=True)
             except PlaywrightTimeoutError:
                 previous_url = page.url
                 try:
@@ -1076,10 +1310,12 @@ class LinkedInJobApplier:
                             self.last_apply_note = "copilot_handoff_unavailable"
                             return False
                     else:
+                        self._log_operation("external_apply_open_failed", job_url=job.url, reason="click_exception")
                         return False
                 page.wait_for_timeout(2000)
                 if page.url != previous_url:
                     external_page = page
+                    self._log_operation("external_apply_opened_same_tab", job_url=job.url)
             except Exception:
                 if self.settings.copilot_mode:
                     assist = self._await_human_assist(
@@ -1097,6 +1333,7 @@ class LinkedInJobApplier:
                         self.last_apply_note = "copilot_handoff_unavailable"
                         return False
                 else:
+                    self._log_operation("external_apply_open_failed", job_url=job.url, reason="unexpected_open_error")
                     return False
 
         if external_page is None:
@@ -1106,6 +1343,7 @@ class LinkedInJobApplier:
             easy_apply = self._find_easy_apply_trigger(external_page)
             if easy_apply:
                 print("Detected Easy Apply after apply click. Switching to Easy Apply flow.")
+                self._log_operation("external_to_easy_redirect", job_url=job.url)
                 return self._apply_easy(external_page, job, cover_letter_path, prefilled_answers)
 
         if self._wait_and_detect_external_login_gate(external_page):
@@ -1128,6 +1366,7 @@ class LinkedInJobApplier:
             if self._wait_and_detect_external_login_gate(external_page):
                 self.last_apply_note = "requires_external_login"
                 print("Skipped: external application requires login outside LinkedIn.")
+                self._log_operation("external_apply_login_required", job_url=job.url)
                 if opened_in_new_tab and external_page is not page:
                     try:
                         external_page.close()
@@ -1165,6 +1404,7 @@ class LinkedInJobApplier:
                         if self._wait_and_detect_external_login_gate(external_page):
                             self.last_apply_note = "requires_external_login"
                             print("Skipped: external application requires login outside LinkedIn.")
+                            self._log_operation("external_apply_login_required", job_url=job.url)
                             return False
                     elif assist == "skip":
                         self.last_apply_note = "copilot_manual_skip"
@@ -1172,17 +1412,88 @@ class LinkedInJobApplier:
                     else:
                         self.last_apply_note = "requires_external_login"
                         print("Skipped: external application requires login outside LinkedIn.")
+                        self._log_operation("external_apply_login_required", job_url=job.url)
                         return False
                 else:
                     self.last_apply_note = "requires_external_login"
                     print("Skipped: external application requires login outside LinkedIn.")
+                    self._log_operation("external_apply_login_required", job_url=job.url)
                     return False
 
             self._inject_llm_form_answers(helper, external_page, job, stage="external_application_form")
             helper.fill_visible_fields(external_page)
             if self._external_apply_success_detected(external_page):
                 submitted = True
+                self._log_operation("external_apply_success", job_url=job.url, detail="initial_detection")
                 break
+
+            validation_messages = self._collect_validation_messages(external_page)
+            visible_fields = helper.collect_visible_fields_snapshot(external_page)
+            candidates, locator_by_id = self._collect_action_candidates(external_page, allow_plain_anchors=True)
+            state_signature = self._build_copilot_state_signature(
+                stage="external_application_form",
+                page=external_page,
+                visible_fields=visible_fields,
+                validation_messages=validation_messages,
+                candidates=candidates,
+            )
+            if state_signature and state_signature == last_state_signature:
+                state_repeat_count += 1
+            else:
+                state_repeat_count = 1 if state_signature else 0
+                last_state_signature = state_signature
+
+            if self.settings.agentic_primary_after_apply:
+                primary_recovery = self._try_llm_stuck_recovery(
+                    page=external_page,
+                    job=job,
+                    stage="external_application_form",
+                    state_signature=state_signature,
+                    root=external_page,
+                    allow_plain_anchors=True,
+                    helper=helper,
+                    action_history=action_history,
+                    is_primary_agentic=True,
+                )
+                if primary_recovery in {"clicked", "retry"}:
+                    external_page.wait_for_timeout(900)
+                    if self._external_apply_success_detected(external_page):
+                        submitted = True
+                        self._log_operation("external_apply_success", job_url=job.url, detail="primary_agentic")
+                        break
+                    continue
+                if primary_recovery == "human":
+                    if manual_assists < 5:
+                        assist = self._await_human_assist(
+                            page=external_page,
+                            helper=helper,
+                            stage="external_application_form",
+                            reason="Primary agentic mode requested manual intervention.",
+                            validation_messages=validation_messages,
+                            state_signature=state_signature,
+                            action_candidates=candidates,
+                        )
+                        if assist == "resume":
+                            manual_assists += 1
+                            external_page.wait_for_timeout(700)
+                            if self._external_apply_success_detected(external_page):
+                                submitted = True
+                                self._log_operation(
+                                    "external_apply_success",
+                                    job_url=job.url,
+                                    detail="manual_resume_after_primary_agentic",
+                                )
+                                break
+                            continue
+                        if assist == "skip":
+                            self.last_apply_note = "copilot_manual_skip"
+                        else:
+                            self.last_apply_note = "copilot_handoff_unavailable"
+                    elif self.settings.copilot_mode and not self.last_apply_note:
+                        self.last_apply_note = "copilot_assist_limit_reached"
+                    if not self.last_apply_note:
+                        self.last_apply_note = "copilot_stuck_external_form"
+                    break
 
             repeated_action_before_step = self._repeated_action_tail(action_history)
             allow_llm_click = repeated_action_before_step < 3
@@ -1198,6 +1509,7 @@ class LinkedInJobApplier:
                 external_page.wait_for_timeout(1000)
                 if self._external_apply_success_detected(external_page):
                     submitted = True
+                    self._log_operation("external_apply_success", job_url=job.url, detail="llm_click")
                     break
                 continue
 
@@ -1206,6 +1518,7 @@ class LinkedInJobApplier:
                 external_page.wait_for_timeout(1200)
                 if self._external_apply_success_detected(external_page):
                     submitted = True
+                    self._log_operation("external_apply_success", job_url=job.url, detail="submit_click")
                     break
                 continue
             if self._click_action(external_page, self.NEXT_TOKENS, ()):
@@ -1225,22 +1538,6 @@ class LinkedInJobApplier:
                 external_page.wait_for_timeout(900)
                 continue
 
-            validation_messages = self._collect_validation_messages(external_page)
-            visible_fields = helper.collect_visible_fields_snapshot(external_page)
-            candidates, locator_by_id = self._collect_action_candidates(external_page, allow_plain_anchors=True)
-            state_signature = self._build_copilot_state_signature(
-                stage="external_application_form",
-                page=external_page,
-                visible_fields=visible_fields,
-                validation_messages=validation_messages,
-                candidates=candidates,
-            )
-            if state_signature and state_signature == last_state_signature:
-                state_repeat_count += 1
-            else:
-                state_repeat_count = 1 if state_signature else 0
-                last_state_signature = state_signature
-
             if self._try_copilot_memory_action(
                 state_signature=state_signature,
                 candidates=candidates,
@@ -1250,6 +1547,7 @@ class LinkedInJobApplier:
                 external_page.wait_for_timeout(900)
                 if self._external_apply_success_detected(external_page):
                     submitted = True
+                    self._log_operation("external_apply_success", job_url=job.url, detail="copilot_memory")
                     break
                 continue
 
@@ -1274,6 +1572,7 @@ class LinkedInJobApplier:
                     external_page.wait_for_timeout(900)
                     if self._external_apply_success_detected(external_page):
                         submitted = True
+                        self._log_operation("external_apply_success", job_url=job.url, detail="stuck_recovery")
                         break
                     continue
                 if recovery == "human":
@@ -1292,6 +1591,11 @@ class LinkedInJobApplier:
                             external_page.wait_for_timeout(700)
                             if self._external_apply_success_detected(external_page):
                                 submitted = True
+                                self._log_operation(
+                                    "external_apply_success",
+                                    job_url=job.url,
+                                    detail="manual_resume_after_stuck_recovery",
+                                )
                                 break
                             continue
                         if assist == "skip":
@@ -1319,6 +1623,7 @@ class LinkedInJobApplier:
                     external_page.wait_for_timeout(700)
                     if self._external_apply_success_detected(external_page):
                         submitted = True
+                        self._log_operation("external_apply_success", job_url=job.url, detail="manual_resume")
                         break
                     continue
                 if assist == "skip":
@@ -1337,6 +1642,8 @@ class LinkedInJobApplier:
                 external_page.close()
         except Exception:
             pass
+        if not submitted:
+            self._log_operation("external_apply_failed", job_url=job.url, note=self.last_apply_note or "")
         return submitted
 
     def _click_external_progress_action(self, page: Page) -> bool:
@@ -1413,6 +1720,7 @@ class LinkedInJobApplier:
     ) -> bool:
         candidates, locator_by_id = self._collect_action_candidates(root, allow_plain_anchors)
         if not candidates:
+            self._log_operation("llm_action_skipped", stage=stage, reason="no_candidates")
             return False
 
         visible_fields: list[dict[str, str | bool | list[str]]] | list[dict] = []
@@ -1432,14 +1740,18 @@ class LinkedInJobApplier:
             validation_messages=validation_messages,
             page_signals=page_signals,
             recent_actions=action_history or [],
+            recent_operations=self._recent_operation_context(limit=20),
         )
         if choice_id is None:
+            self._log_operation("llm_action_skipped", stage=stage, reason="llm_no_choice", candidates=len(candidates))
             return False
 
         chosen_locator = locator_by_id.get(choice_id)
         if chosen_locator is None:
+            self._log_operation("llm_action_skipped", stage=stage, reason="choice_locator_missing", choice_id=choice_id)
             return False
 
+        chosen_label = ""
         try:
             chosen_label = next(
                 (
@@ -1456,8 +1768,21 @@ class LinkedInJobApplier:
                     print(f"LLM click: {chosen_label}")
             self._append_action_history(action_history, chosen_label or f"id={choice_id}")
             chosen_locator.click()
+            self._log_operation(
+                "llm_action_clicked",
+                stage=stage,
+                choice_id=choice_id,
+                label=chosen_label or "",
+                reason=reason or "",
+            )
             return True
         except Exception:
+            self._log_operation(
+                "llm_action_failed",
+                stage=stage,
+                choice_id=choice_id,
+                label=chosen_label or "",
+            )
             return False
 
     def _collect_action_candidates(
@@ -2194,6 +2519,12 @@ class LinkedInJobApplier:
             candidates=candidates,
         )
         if index is None:
+            if state_signature:
+                self._log_operation(
+                    "copilot_memory_action_skipped",
+                    reason="no_memory_match",
+                    state_signature=state_signature,
+                )
             return False
 
         node = locator_by_id.get(index)
@@ -2206,6 +2537,12 @@ class LinkedInJobApplier:
                         action_label=failed_label,
                         success=False,
                     )
+            self._log_operation(
+                "copilot_memory_action_skipped",
+                reason="locator_missing",
+                state_signature=state_signature,
+                index=index,
+            )
             return False
 
         label = str(candidates[index].get("label", "")).strip() if index < len(candidates) else ""
@@ -2214,6 +2551,13 @@ class LinkedInJobApplier:
                 print(f"Copilot memory click: {label} | {reason}")
             node.click()
             self._append_action_history(action_history, label or f"memory_id={index}")
+            self._log_operation(
+                "copilot_memory_action_clicked",
+                state_signature=state_signature,
+                index=index,
+                label=label,
+                reason=reason or "",
+            )
             if state_signature and label:
                 self.knowledge.mark_copilot_recipe_result(
                     state_signature=state_signature,
@@ -2222,6 +2566,12 @@ class LinkedInJobApplier:
                 )
             return True
         except Exception:
+            self._log_operation(
+                "copilot_memory_action_failed",
+                state_signature=state_signature,
+                index=index,
+                label=label,
+            )
             if state_signature and label:
                 self.knowledge.mark_copilot_recipe_result(
                     state_signature=state_signature,
@@ -2287,12 +2637,30 @@ class LinkedInJobApplier:
         allow_plain_anchors: bool,
         helper: FormHelper,
         action_history: list[str],
+        is_primary_agentic: bool = False,
     ) -> str:
         raw_html, html_excerpt = self._extract_html_excerpt(page)
-        snapshot_path = self._save_stuck_html_snapshot(job=job, stage=stage, raw_html=raw_html)
-        if snapshot_path is not None:
-            print(f"[Copilot] Stuck HTML snapshot: {snapshot_path}")
-        self.metrics.record_fallback_trigger(stage=stage)
+        metrics_stage = f"{stage}_primary_agentic" if is_primary_agentic else stage
+        self._log_operation(
+            "llm_recovery_triggered",
+            stage=stage,
+            metrics_stage=metrics_stage,
+            is_primary_agentic=is_primary_agentic,
+            job_url=job.url,
+            state_signature=state_signature,
+            html_excerpt_len=len(html_excerpt),
+        )
+        if not is_primary_agentic:
+            snapshot_path = self._save_stuck_html_snapshot(job=job, stage=stage, raw_html=raw_html)
+            if snapshot_path is not None:
+                print(f"[Copilot] Stuck HTML snapshot: {snapshot_path}")
+                self._log_operation(
+                    "llm_recovery_snapshot_saved",
+                    stage=stage,
+                    job_url=job.url,
+                    path=str(snapshot_path),
+                )
+        self.metrics.record_fallback_trigger(stage=metrics_stage)
         outcome = self.agentic_fallback.run(
             page=page,
             root=root,
@@ -2302,14 +2670,34 @@ class LinkedInJobApplier:
             helper=helper,
             action_history=action_history,
             allow_plain_anchors=allow_plain_anchors,
+            recent_operations=self._recent_operation_context(limit=30),
         )
         if outcome.trace_path:
-            print(f"[Copilot] Agentic trace: {outcome.trace_path}")
+            if is_primary_agentic:
+                print(f"[Copilot] Primary agentic trace: {outcome.trace_path}")
+            else:
+                print(f"[Copilot] Agentic trace: {outcome.trace_path}")
+            self._log_operation(
+                "llm_recovery_trace_saved",
+                stage=stage,
+                job_url=job.url,
+                trace_path=outcome.trace_path,
+            )
         self.metrics.record_fallback_outcome(
-            stage=stage,
+            stage=metrics_stage,
             result=outcome.result,
             playbook_source=outcome.playbook_source,
             tool_steps_used=outcome.tool_steps_used,
+        )
+        self._log_operation(
+            "llm_recovery_outcome",
+            stage=stage,
+            job_url=job.url,
+            result=outcome.result,
+            playbook_source=outcome.playbook_source,
+            tool_steps_used=outcome.tool_steps_used,
+            reason=outcome.reason or "",
+            clicked_label=outcome.clicked_label or "",
         )
         if state_signature and outcome.playbook_steps:
             if outcome.playbook_source == "memory":
@@ -2339,7 +2727,10 @@ class LinkedInJobApplier:
         if outcome.result == "clicked":
             label = outcome.clicked_label.strip()
             if label:
-                print(f"LLM stuck recovery click: {label} | {outcome.reason}")
+                if is_primary_agentic:
+                    print(f"LLM primary agentic click: {label} | {outcome.reason}")
+                else:
+                    print(f"LLM stuck recovery click: {label} | {outcome.reason}")
                 self._append_action_history(action_history, label)
                 if state_signature:
                     self.knowledge.remember_copilot_recipe(
@@ -2351,16 +2742,25 @@ class LinkedInJobApplier:
 
         if outcome.result == "retry":
             if outcome.reason:
-                print(f"LLM stuck recovery: retry | {outcome.reason}")
+                if is_primary_agentic:
+                    print(f"LLM primary agentic: retry | {outcome.reason}")
+                else:
+                    print(f"LLM stuck recovery: retry | {outcome.reason}")
             return "retry"
 
         if outcome.result == "human":
             if outcome.reason:
-                print(f"LLM stuck recovery: wait_human | {outcome.reason}")
+                if is_primary_agentic:
+                    print(f"LLM primary agentic: wait_human | {outcome.reason}")
+                else:
+                    print(f"LLM stuck recovery: wait_human | {outcome.reason}")
             return "human"
 
         if html_excerpt:
-            print("LLM stuck recovery: no safe action from agentic controller.")
+            if is_primary_agentic:
+                print("LLM primary agentic: no safe action from agentic controller.")
+            else:
+                print("LLM stuck recovery: no safe action from agentic controller.")
         return "none"
 
     def _learn_from_manual_delta(
@@ -2411,8 +2811,10 @@ class LinkedInJobApplier:
         action_candidates: list[dict[str, str]] | None = None,
     ) -> str:
         if not self.settings.copilot_mode:
+            self._log_operation("human_handoff_unavailable", stage=stage, reason="copilot_disabled")
             return "unavailable"
         if self._is_page_closed(page):
+            self._log_operation("human_handoff_unavailable", stage=stage, reason="page_closed")
             return "unavailable"
 
         before_snapshot: list[dict[str, Any]] = []
@@ -2423,6 +2825,15 @@ class LinkedInJobApplier:
         before_url = page.url
         events_cursor = self._interaction_cursor(page)
         self.metrics.record_human_handoff(stage=stage, result="requested")
+        self._log_operation(
+            "human_handoff_requested",
+            stage=stage,
+            reason=reason,
+            validation_messages=validation_messages[:6] if validation_messages else [],
+            state_signature=state_signature,
+            action_candidates_count=len(action_candidates or []),
+            url=before_url,
+        )
 
         print(f"[Copilot] Manual assistance needed ({stage}): {reason}")
         if validation_messages:
@@ -2437,6 +2848,7 @@ class LinkedInJobApplier:
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._is_page_closed(page):
+                self._log_operation("human_handoff_unavailable", stage=stage, reason="page_closed_during_wait")
                 return "unavailable"
             page.wait_for_timeout(self.settings.copilot_poll_interval_ms)
 
@@ -2476,9 +2888,18 @@ class LinkedInJobApplier:
                     action_candidates=action_candidates,
                     events=recent_events,
                 )
+            self._log_operation(
+                "human_handoff_resumed",
+                stage=stage,
+                url_changed=url_changed,
+                snapshot_changed=snapshot_changed,
+                validation_changed=validation_changed,
+                recent_event_count=len(recent_events),
+            )
             return "resume"
 
         print("[Copilot] Manual assistance timeout reached.")
+        self._log_operation("human_handoff_timeout", stage=stage, auto_skip=self.settings.copilot_auto_skip_on_timeout)
         if self.settings.copilot_auto_skip_on_timeout:
             return "skip"
         return "unavailable"

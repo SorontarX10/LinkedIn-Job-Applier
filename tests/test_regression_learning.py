@@ -22,6 +22,7 @@ class _StubLLM:
         validation_messages=None,
         page_signals=None,
         recent_actions=None,
+        recent_operations=None,
         html_excerpt: str = "",
         max_steps: int = 4,
     ):
@@ -34,6 +35,7 @@ class _StubLLM:
             validation_messages,
             page_signals,
             recent_actions,
+            recent_operations,
             html_excerpt,
             max_steps,
         )
@@ -49,9 +51,10 @@ class _StubLLM:
         validation_messages=None,
         page_signals=None,
         recent_actions=None,
+        recent_operations=None,
         html_excerpt: str = "",
     ):
-        del job, page_url, stage, candidates, visible_fields, validation_messages, page_signals, recent_actions, html_excerpt
+        del job, page_url, stage, candidates, visible_fields, validation_messages, page_signals, recent_actions, recent_operations, html_excerpt
         return "wait_human", None, "manual help required"
 
 

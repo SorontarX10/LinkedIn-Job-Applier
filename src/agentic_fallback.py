@@ -71,6 +71,7 @@ class AgenticFallbackController:
         helper: FormHelper | None,
         action_history: list[str] | None,
         allow_plain_anchors: bool,
+        recent_operations: list[dict[str, Any]] | None = None,
     ) -> AgenticFallbackOutcome:
         self.executor.reset_session()
         trace: list[dict[str, Any]] = []
@@ -121,6 +122,7 @@ class AgenticFallbackController:
                     validation_messages=validation_messages,
                     page_signals=page_signals,
                     recent_actions=action_history or [],
+                    recent_operations=recent_operations or [],
                     html_excerpt=html_excerpt,
                     max_steps=self.llm_plan_max_steps,
                 )
@@ -172,6 +174,7 @@ class AgenticFallbackController:
                 validation_messages=validation_messages,
                 page_signals=page_signals,
                 recent_actions=action_history or [],
+                recent_operations=recent_operations or [],
                 html_excerpt=html_excerpt,
             )
             strategy = strategy.strip().lower()

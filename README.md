@@ -81,6 +81,7 @@ Queue retry env controls (`.env`):
 - `output/cover_letters/`: generated cover letters.
 - `output/tailored_cv/`: per-job tailoring notes.
 - `output/metrics/`: run KPI reports (`latest.json`, `run_*.json`, `runs.jsonl`).
+- `output/operations/`: append-only operational history for each run (`run_*.jsonl`, `latest.jsonl`).
 - `data/browser-profile/`: persistent browser profile/session.
 
 ## 3.1 Discovery Module (foundation)
@@ -117,6 +118,8 @@ Queue retry env controls (`.env`):
 - `AGENTIC_FALLBACK_MAX_ITERATIONS`, `AGENTIC_TOOL_STEP_LIMIT`, `AGENTIC_TOOL_TIMEOUT_SEC` tune LLM tool fallback limits (defaults now increased for harder forms).
 - `AGENTIC_LLM_PLAN_ENABLED=true` lets LLM propose short multi-step tool sequences (not only single-click strategy).
 - `AGENTIC_LLM_PLAN_MAX_STEPS` controls max tool calls in one LLM plan.
+- `AGENTIC_PRIMARY_AFTER_APPLY=true` runs full LLM+Playwright tool controller immediately after opening Apply/Easy Apply form.
+- LLM action/recovery prompts now include recent operation history from `output/operations/latest.jsonl`, so it can avoid repeating failed steps in the same run.
 - `AGENTIC_BLOCKED_ACTION_TOKENS` is a safety blacklist for risky button labels in agentic click fallback.
 - `AGENTIC_PLAYBOOK_CONFIDENCE_THRESHOLD` and `AGENTIC_PLAYBOOK_MIN_USES` control when memorized playbooks can auto-run.
 - `JOB_QUEUE_RETRY_LIMIT` and `JOB_QUEUE_RETRY_COOLDOWN_MINUTES` prevent retry storms for failing postings.
@@ -149,6 +152,9 @@ Covered scenarios:
   - `latest.json` (last run snapshot),
   - `run_<timestamp>.json` (per-run archive),
   - `runs.jsonl` (append-only history).
+- Every run writes operation timeline to `output/operations/`:
+  - `run_<timestamp>.jsonl` (full event stream for one run),
+  - `latest.jsonl` (event stream from the most recent run).
 - KPI set:
   - `application_success_rate`
   - `fallback_trigger_rate`

@@ -231,6 +231,7 @@ class LLMJobAgent:
         validation_messages: list[str] | None = None,
         page_signals: dict[str, Any] | None = None,
         recent_actions: list[str] | None = None,
+        recent_operations: list[dict[str, Any]] | None = None,
     ) -> tuple[int | None, str]:
         if not self.enabled or not candidates:
             return None, ""
@@ -238,6 +239,7 @@ class LLMJobAgent:
         system_prompt = (
             "You choose the next UI action for a job application flow.\n"
             "Choose exactly one candidate button/link id that best progresses toward submitting the application.\n"
+            "Use recent_operations to avoid repeating already-failed actions.\n"
             "If required fields are missing or validation errors are visible, prefer actions that help complete form fields.\n"
             "Avoid repeatedly clicking submit/review when validation errors still exist.\n"
             "Avoid close, cancel, discard, back, sign-in, register, policy, or navigation-away actions.\n"
@@ -251,6 +253,7 @@ class LLMJobAgent:
             "validation_messages": (validation_messages or [])[:12],
             "page_signals": page_signals or {},
             "recent_actions": (recent_actions or [])[-8:],
+            "recent_operations": (recent_operations or [])[-20:],
             "candidates": candidates[:40],
             "output_format": {"button_id": "integer id from candidates or -1", "reason": "short string"},
         }
@@ -289,6 +292,7 @@ class LLMJobAgent:
         validation_messages: list[str] | None = None,
         page_signals: dict[str, Any] | None = None,
         recent_actions: list[str] | None = None,
+        recent_operations: list[dict[str, Any]] | None = None,
         html_excerpt: str = "",
     ) -> tuple[str, int | None, str]:
         allowed_strategies = {"click_candidate", "wait_human", "wait_and_retry", "fill_and_retry"}
@@ -304,6 +308,7 @@ class LLMJobAgent:
         system_prompt = (
             "You are a recovery controller for stuck web form automation.\n"
             "Given page state and HTML excerpt, choose a single strategy to break deadlock.\n"
+            "Use recent_operations to avoid loops and to infer what was already attempted.\n"
             "Strategies:\n"
             "- click_candidate: click one candidate id now\n"
             "- fill_and_retry: refill fields and retry loop\n"
@@ -320,6 +325,7 @@ class LLMJobAgent:
             "validation_messages": (validation_messages or [])[:12],
             "page_signals": page_signals or {},
             "recent_actions": (recent_actions or [])[-10:],
+            "recent_operations": (recent_operations or [])[-25:],
             "candidates": candidates[:40],
             "html_excerpt": html_excerpt[:32000],
             "output_format": {
@@ -384,6 +390,7 @@ class LLMJobAgent:
         validation_messages: list[str] | None = None,
         page_signals: dict[str, Any] | None = None,
         recent_actions: list[str] | None = None,
+        recent_operations: list[dict[str, Any]] | None = None,
         html_excerpt: str = "",
         max_steps: int = 4,
     ) -> tuple[list[dict[str, Any]], str, bool]:
@@ -406,6 +413,7 @@ class LLMJobAgent:
         system_prompt = (
             "You are a tool-planning controller for stuck form automation.\n"
             "Return a short sequence of tool calls to unblock progress.\n"
+            "Use recent_operations to avoid repeating already-failed steps.\n"
             "Use only allowed tools and only IDs/labels provided in candidates/visible_fields.\n"
             "Prioritize truthful form completion and safe progression.\n"
             "If captcha/login or high uncertainty, choose human handoff.\n"
@@ -420,6 +428,7 @@ class LLMJobAgent:
             "validation_messages": (validation_messages or [])[:12],
             "page_signals": page_signals or {},
             "recent_actions": (recent_actions or [])[-10:],
+            "recent_operations": (recent_operations or [])[-25:],
             "html_excerpt": html_excerpt[:32000],
             "allowed_tools": sorted(allowed_tools),
             "max_steps": steps_cap,

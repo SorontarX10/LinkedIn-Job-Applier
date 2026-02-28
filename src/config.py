@@ -88,6 +88,7 @@ class Settings:
     agentic_playbook_min_uses: int
     agentic_llm_plan_enabled: bool
     agentic_llm_plan_max_steps: int
+    agentic_primary_after_apply: bool
     discovery_enabled: bool
     discovery_keywords_include: tuple[str, ...]
     discovery_keywords_exclude: tuple[str, ...]
@@ -155,6 +156,7 @@ def load_settings() -> Settings:
     agentic_playbook_min_uses = max(1, int(os.getenv("AGENTIC_PLAYBOOK_MIN_USES", "1")))
     agentic_llm_plan_enabled = _to_bool(os.getenv("AGENTIC_LLM_PLAN_ENABLED"), default=True)
     agentic_llm_plan_max_steps = max(1, min(10, int(os.getenv("AGENTIC_LLM_PLAN_MAX_STEPS", "4"))))
+    agentic_primary_after_apply = _to_bool(os.getenv("AGENTIC_PRIMARY_AFTER_APPLY"), default=True)
     discovery_enabled = _to_bool(os.getenv("DISCOVERY_ENABLED"), default=False)
     discovery_keywords_include = _to_list(os.getenv("DISCOVERY_KEYWORDS_INCLUDE", ""))
     discovery_keywords_exclude = _to_list(os.getenv("DISCOVERY_KEYWORDS_EXCLUDE", ""))
@@ -214,6 +216,7 @@ def load_settings() -> Settings:
         agentic_playbook_min_uses=agentic_playbook_min_uses,
         agentic_llm_plan_enabled=agentic_llm_plan_enabled,
         agentic_llm_plan_max_steps=agentic_llm_plan_max_steps,
+        agentic_primary_after_apply=agentic_primary_after_apply,
         discovery_enabled=discovery_enabled,
         discovery_keywords_include=discovery_keywords_include,
         discovery_keywords_exclude=discovery_keywords_exclude,

@@ -94,6 +94,7 @@ def _make_settings(base_dir: Path) -> Settings:
         agentic_playbook_min_uses=1,
         agentic_llm_plan_enabled=True,
         agentic_llm_plan_max_steps=4,
+        agentic_primary_after_apply=True,
         discovery_enabled=True,
         discovery_keywords_include=("agentic ai", "python"),
         discovery_keywords_exclude=("onsite only",),
