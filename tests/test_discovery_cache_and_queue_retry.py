@@ -35,6 +35,24 @@ class _FakeDiscoveryPage:
 
 
 class DiscoveryCacheAndQueueRetryTest(unittest.TestCase):
+    def test_discovery_text_cleanup_deduplicates_noise(self) -> None:
+        self.assertEqual(
+            JobDiscovery._clean_discovery_title("Head of SEO | RemoteHead of SEO | Remote"),
+            "Head of SEO | Remote",
+        )
+        self.assertEqual(
+            JobDiscovery._clean_discovery_title("Expert AI Engineer Expert AI Engineer with verification"),
+            "Expert AI Engineer",
+        )
+        self.assertEqual(
+            JobDiscovery._clean_discovery_company("with verification"),
+            "",
+        )
+        self.assertEqual(
+            JobDiscovery._clean_discovery_location("Warsaw, Mazowieckie, Poland Be an early applicant 2 days ago"),
+            "Warsaw, Mazowieckie, Poland",
+        )
+
     def test_discovery_uses_cache_for_same_query(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

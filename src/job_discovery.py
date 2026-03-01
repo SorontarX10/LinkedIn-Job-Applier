@@ -188,9 +188,9 @@ class JobDiscovery:
                         continue
                     seen_urls.add(normalized_url)
 
-                    title = self._clean_text(str(card.get("title", "")).strip()) or "Unknown title"
-                    company = self._clean_text(str(card.get("company", "")).strip()) or "Unknown company"
-                    location = self._clean_text(str(card.get("location", "")).strip())
+                    title = self._clean_discovery_title(str(card.get("title", "")).strip()) or "Unknown title"
+                    company = self._clean_discovery_company(str(card.get("company", "")).strip()) or "Unknown company"
+                    location = self._clean_discovery_location(str(card.get("location", "")).strip())
                     snippet = self._clean_text(str(card.get("snippet", "")).strip())[:600]
                     results.append(
                         DiscoveryJob(
@@ -412,40 +412,81 @@ class JobDiscovery:
                     const anchors = Array.from(document.querySelectorAll("a[href*='/jobs/view/']"));
                     const out = [];
                     const seen = new Set();
+                    const trim = (text) => (text || '').replace(/\\s+/g, ' ').trim();
                     const pickText = (root, selectors) => {
                         if (!root) return '';
                         for (const selector of selectors) {
-                            const el = root.querySelector(selector);
-                            if (!el) continue;
-                            const text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-                            if (text) return text;
+                            const elements = Array.from(root.querySelectorAll(selector));
+                            for (const el of elements) {
+                                if (!el) continue;
+                                const text = trim(el.textContent);
+                                if (text) return text;
+                            }
                         }
                         return '';
+                    };
+                    const pickAnchorVisibleText = (anchor) => {
+                        if (!anchor) return '';
+                        const visible = anchor.querySelector("[aria-hidden='true']");
+                        if (visible) {
+                            const text = trim(visible.textContent);
+                            if (text) return text;
+                        }
+                        return trim(anchor.textContent);
+                    };
+                    const looksLikeJobResultAnchor = (anchor, card) => {
+                        const aClass = trim(anchor.className).toLowerCase();
+                        const cardClass = trim(card?.className || '').toLowerCase();
+                        if (aClass.includes('base-card') || aClass.includes('job-card')) return true;
+                        if (cardClass.includes('job') || cardClass.includes('base-card') || cardClass.includes('search-results')) return true;
+                        return false;
                     };
                     for (const anchor of anchors) {
                         const href = anchor.getAttribute('href') || '';
                         if (!href.includes('/jobs/view/')) continue;
                         const card = anchor.closest('li') || anchor.closest("div[class*='job']");
+                        if (!card || !looksLikeJobResultAnchor(anchor, card)) continue;
+
                         const title = (
-                            (anchor.textContent || '').replace(/\\s+/g, ' ').trim()
-                            || pickText(card, ['h3', '[class*=title]', '[data-test-job-card-title]'])
+                            pickAnchorVisibleText(anchor)
+                            || trim(anchor.getAttribute('aria-label'))
+                            || pickText(card, [
+                                'h3',
+                                'h4',
+                                '[class*=title]',
+                                '[class*=job-card-list__title]',
+                                '[data-test-job-card-title]'
+                            ])
                         );
                         const company = pickText(card, [
                             '.base-search-card__subtitle',
+                            '.base-search-card__subtitle a',
                             '.job-card-container__company-name',
+                            '.job-card-container__primary-description',
+                            '.artdeco-entity-lockup__subtitle',
+                            '.artdeco-entity-lockup__subtitle span',
+                            '.job-card-list__subtitle',
+                            '.jobs-search-results-list__subtitle',
+                            '[data-test-job-card-company-name]',
                             '[class*=company]',
                         ]);
                         const location = pickText(card, [
                             '.job-search-card__location',
                             '.base-search-card__metadata',
+                            '.job-card-container__metadata-item',
+                            '.artdeco-entity-lockup__caption',
+                            '.job-card-container__metadata-wrapper li',
+                            '[data-test-job-card-location]',
                             '[class*=location]',
                         ]);
                         const snippet = pickText(card, [
                             '.job-search-card__snippet',
+                            '.job-card-list__description',
+                            '.job-card-container__description',
                             '[class*=description]',
                             '[class*=snippet]',
                         ]);
-                        const key = `${href}|${title}|${company}`;
+                        const key = `${href}`;
                         if (seen.has(key)) continue;
                         seen.add(key);
                         out.push({ href, title, company, location, snippet });
@@ -483,6 +524,75 @@ class JobDiscovery:
     def _clean_text(text: str) -> str:
         compact = re.sub(r"\s+", " ", text).strip()
         return compact[:220]
+
+    @classmethod
+    def _clean_discovery_title(cls, text: str) -> str:
+        compact = cls._clean_text(text)
+        if not compact:
+            return ""
+        compact = cls._strip_noise_suffixes(compact)
+        compact = cls._collapse_repeated_phrase(compact)
+        return cls._clean_text(compact)
+
+    @classmethod
+    def _clean_discovery_company(cls, text: str) -> str:
+        compact = cls._clean_text(text)
+        if not compact:
+            return ""
+        compact = cls._strip_noise_suffixes(compact)
+        compact = cls._collapse_repeated_phrase(compact)
+        blocked = {
+            "with verification",
+            "verified",
+            "verification",
+            "promoted",
+            "easy apply",
+        }
+        if _normalize(compact) in {_normalize(item) for item in blocked}:
+            return ""
+        return cls._clean_text(compact)
+
+    @classmethod
+    def _clean_discovery_location(cls, text: str) -> str:
+        compact = cls._clean_text(text)
+        if not compact:
+            return ""
+        compact = cls._strip_noise_suffixes(compact)
+        compact = re.sub(r"\b(?:be an early applicant|reposted)\b.*$", "", compact, flags=re.IGNORECASE).strip()
+        compact = cls._collapse_repeated_phrase(compact)
+        return cls._clean_text(compact)
+
+    @staticmethod
+    def _strip_noise_suffixes(text: str) -> str:
+        cleaned = text
+        noise_patterns = (
+            r"\s+with verification$",
+            r"\s+verified$",
+            r"\s+promoted$",
+        )
+        for pattern in noise_patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+        return cleaned
+
+    @staticmethod
+    def _collapse_repeated_phrase(text: str) -> str:
+        value = str(text).strip()
+        if len(value) < 8:
+            return value
+
+        # Exact duplicated string: "TitleTitle" or "Title Title"
+        match = re.match(r"^(.{4,180}?)\s*\1$", value)
+        if match:
+            return match.group(1).strip()
+
+        # Duplicated token sequence: "Head of SEO Head of SEO"
+        tokens = value.split()
+        if len(tokens) >= 4 and len(tokens) % 2 == 0:
+            half = len(tokens) // 2
+            if tokens[:half] == tokens[half:]:
+                return " ".join(tokens[:half]).strip()
+
+        return value
 
     @staticmethod
     def _is_page_closed(page: Page) -> bool:
