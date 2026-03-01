@@ -11,6 +11,7 @@ from src.cv_tools import extract_cv_text
 from src.knowledge_store import KnowledgeStore
 from src.linkedin_bot import LinkedInJobApplier
 from src.llm_agent import LLMJobAgent
+from src.mcp_bridge import drain_spool_once
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +40,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Max number of jobs to collect during discovery phase",
     )
+    parser.add_argument("--mcp-off", action="store_true", help="Disable MCP publishing for this run.")
+    parser.add_argument(
+        "--mcp-drain-spool-only",
+        action="store_true",
+        help="Drain queued MCP events from local spool and exit.",
+    )
+    parser.add_argument("--mcp-timeout", type=int, default=None, help="Override MCP_PUBLISH_TIMEOUT_SEC")
     return parser.parse_args()
 
 
@@ -171,12 +179,27 @@ def apply_cli_overrides(settings: Settings, args: argparse.Namespace) -> Setting
         updated = replace(updated, system_chrome_profile_name=args.chrome_profile.strip())
     if args.browser_channel:
         updated = replace(updated, browser_channel=args.browser_channel.strip().lower() or None)
+    if args.mcp_off:
+        updated = replace(updated, mcp_enabled=False)
+    if args.mcp_timeout is not None:
+        updated = replace(updated, mcp_publish_timeout_sec=max(1, int(args.mcp_timeout)))
     return updated
 
 
 def main() -> None:
     args = parse_args()
     settings = apply_cli_overrides(load_settings(), args)
+
+    if args.mcp_drain_spool_only:
+        stats = drain_spool_once(settings)
+        print(
+            "MCP spool drain completed: "
+            f"backlog={stats.get('mcp_spool_backlog', 0)}, "
+            f"dead_letter={stats.get('mcp_dead_letter_count', 0)}, "
+            f"publish_success={stats.get('mcp_publish_success', 0)}, "
+            f"publish_fail={stats.get('mcp_publish_fail', 0)}"
+        )
+        return
 
     cv_path = ensure_cv_path(settings, args.cv_path)
     cv_text = extract_cv_text(cv_path)

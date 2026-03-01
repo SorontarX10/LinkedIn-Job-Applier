@@ -106,6 +106,23 @@ def _make_settings(base_dir: Path) -> Settings:
         discovery_cache_ttl_minutes=90,
         job_queue_retry_limit=3,
         job_queue_retry_cooldown_minutes=30,
+        mcp_enabled=False,
+        mcp_fail_open=True,
+        mcp_config_path=base_dir / "data" / "mcp_servers.runtime.json",
+        mcp_spool_path=base_dir / "data" / "mcp_spool.jsonl",
+        mcp_publish_timeout_sec=2,
+        mcp_retry_limit=3,
+        mcp_retry_backoff_sec=1,
+        mcp_redact_pii=True,
+        mcp_linear_enabled=False,
+        mcp_linear_team="",
+        mcp_linear_project="",
+        mcp_linear_default_state="Backlog",
+        mcp_notion_enabled=False,
+        mcp_notion_data_source_id="",
+        mcp_notion_parent_page_id="",
+        mcp_figma_enabled=False,
+        mcp_figma_file_key="",
     )
 
 

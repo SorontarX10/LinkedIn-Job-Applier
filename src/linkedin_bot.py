@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import re
+import sys
 import time
 import unicodedata
 from difflib import SequenceMatcher
@@ -24,6 +25,7 @@ from src.llm_agent import LLMJobAgent
 from src.models import ApplicationRecord, FitDecision, JobPosting
 from src.operation_history import OperationHistoryTracker
 from src.run_metrics import RunMetricsTracker
+from src.mcp_bridge import McpEventPublisher
 
 
 def _normalize(text: str) -> str:
@@ -44,6 +46,7 @@ def _normalize(text: str) -> str:
 class LinkedInJobApplier:
     SAVED_JOBS_URL = "https://www.linkedin.com/my-items/saved-jobs/?cardType=SAVED"
     FEED_URL = "https://www.linkedin.com/feed/"
+    JOBS_HOME_URL = "https://www.linkedin.com/jobs/"
 
     EASY_APPLY_TOKENS = ("easy apply", "latwe aplikowanie")
     EXTERNAL_APPLY_TOKENS = ("apply", "aplikuj", "visit", "apply on company")
@@ -124,11 +127,22 @@ class LinkedInJobApplier:
         self.discover_max = max(1, int(discover_max)) if discover_max is not None else self.settings.discovery_max_results
         self.operations = OperationHistoryTracker(base_dir=self.settings.base_dir, mode=self.run_mode)
         self.metrics = RunMetricsTracker(base_dir=self.settings.base_dir, mode=self.run_mode)
+        self.mcp = McpEventPublisher(
+            settings=self.settings,
+            run_id=self.operations.run_id,
+            snapshot_provider=self._mcp_run_snapshot,
+        )
         self.last_apply_note = ""
 
     def run(self) -> None:
         allowed_modes = {"saved_only", "discovery_only", "discovery_and_apply"}
         mode = self.run_mode if self.run_mode in allowed_modes else "saved_only"
+        if self.settings.mcp_enabled:
+            try:
+                self.mcp.start()
+                self.mcp.drain_spool(max_items=120)
+            except Exception:
+                pass
         self._log_operation(
             "run_started",
             requested_mode=self.run_mode,
@@ -311,21 +325,73 @@ class LinkedInJobApplier:
                                 return
                             break
             finally:
+                self._publish_mcp_event(
+                    event_type="run_finished",
+                    payload={
+                        "event": "run_finished",
+                        "mode": mode,
+                    },
+                )
+                if self.settings.mcp_enabled:
+                    try:
+                        self.mcp.drain_spool(max_items=200)
+                    except Exception:
+                        pass
+                    mcp_stats = self.mcp.stats()
+                    self.metrics.set_mcp_queue_stats(
+                        spool_backlog=mcp_stats.get("mcp_spool_backlog", 0),
+                        dead_letter_count=mcp_stats.get("mcp_dead_letter_count", 0),
+                    )
                 report_path = self.metrics.finalize_and_save()
                 if report_path:
                     print(f"Metrics report: {report_path}")
                     self._log_operation("metrics_report_saved", path=str(report_path))
                 self.operations.finalize(metrics_report_path=str(report_path) if report_path else "")
                 try:
+                    self.mcp.stop()
+                except Exception:
+                    pass
+                try:
                     context.close()
                 except Exception:
                     pass
 
     def _log_operation(self, event: str, **data: Any) -> None:
+        payload: dict[str, Any] = {"event": event}
+        payload.update(data)
         try:
             self.operations.log(event, **data)
         except Exception:
             pass
+        self._publish_mcp_event(event_type=event, payload=payload)
+        if event == "llm_recovery_triggered":
+            self._publish_mcp_event(event_type="fallback_triggered", payload=payload)
+        elif event == "llm_recovery_outcome":
+            self._publish_mcp_event(event_type="fallback_outcome", payload=payload)
+        elif event == "human_handoff_requested":
+            self._publish_mcp_event(event_type="human_handoff_started", payload=payload)
+        elif event == "human_handoff_resumed":
+            self._publish_mcp_event(event_type="human_handoff_resolved", payload=payload)
+        elif event == "human_handoff_timeout":
+            self._publish_mcp_event(event_type="human_handoff_timeout", payload=payload)
+
+    def _publish_mcp_event(self, *, event_type: str, payload: dict[str, Any]) -> None:
+        if not self.settings.mcp_enabled:
+            return
+        try:
+            ok = self.mcp.publish_event(event_type=event_type, payload=payload)
+            self.metrics.record_mcp_publish(success=ok)
+        except Exception:
+            self.metrics.record_mcp_publish(success=False)
+
+    def _mcp_run_snapshot(self) -> dict[str, Any]:
+        snapshot = self.metrics.snapshot()
+        snapshot["run_id"] = self.operations.run_id
+        snapshot["mode"] = self.run_mode
+        snapshot["recent_operations"] = self._recent_operation_context(limit=30)
+        if self.settings.mcp_enabled:
+            snapshot["mcp"] = self.mcp.stats()
+        return snapshot
 
     def _recent_operation_context(self, limit: int = 25) -> list[dict[str, str | int]]:
         recent = self.operations.recent(limit=limit)
@@ -439,8 +505,11 @@ class LinkedInJobApplier:
         if top_preview:
             print("Top discovery results:")
             for index, item in enumerate(top_preview, start=1):
+                title = self._sanitize_for_console(str(item.get("title", "")))
+                company = self._sanitize_for_console(str(item.get("company", "")))
+                location = self._sanitize_for_console(str(item.get("location", "")))
                 print(
-                    f"  {index}. score={item['score']} | {item['title']} | {item['company']} | {item['location']}"
+                    f"  {index}. score={item['score']} | {title} | {company} | {location}"
                 )
 
         return {
@@ -528,13 +597,15 @@ class LinkedInJobApplier:
         return context
 
     def _ensure_logged_in(self, page: Page) -> bool:
-        self._goto_with_retries(page, self.FEED_URL)
+        self._goto_with_retries(page, self.JOBS_HOME_URL)
         page.wait_for_timeout(1200)
 
         if self._is_linkedin_authenticated(page):
+            self._log_operation("linkedin_authenticated", landing_url=page.url)
             return True
 
         print("LinkedIn session not detected. Log in in the browser window; bot will resume automatically.")
+        self._log_operation("linkedin_login_required", current_url=page.url)
         if self._requires_linkedin_login(page):
             try:
                 self._goto_with_retries(page, "https://www.linkedin.com/login")
@@ -548,14 +619,18 @@ class LinkedInJobApplier:
                 return False
             if self._is_linkedin_authenticated(page):
                 try:
-                    self._goto_with_retries(page, self.FEED_URL)
+                    self._goto_with_retries(page, self.JOBS_HOME_URL)
                     page.wait_for_timeout(900)
                 except Exception:
                     pass
-                return self._is_linkedin_authenticated(page)
+                authenticated = self._is_linkedin_authenticated(page)
+                if authenticated:
+                    self._log_operation("linkedin_authenticated_after_wait", landing_url=page.url)
+                return authenticated
             page.wait_for_timeout(self.settings.copilot_poll_interval_ms)
 
         print("LinkedIn login wait timed out. Please log in and run again.")
+        self._log_operation("linkedin_login_timeout")
         return False
 
     def _is_linkedin_authenticated(self, page: Page) -> bool:
@@ -1660,6 +1735,15 @@ class LinkedInJobApplier:
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _sanitize_for_console(text: str) -> str:
+        clean = " ".join(str(text).split())
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        try:
+            return clean.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        except Exception:
+            return clean
 
     @staticmethod
     def _append_action_history(action_history: list[str] | None, label: str, max_items: int = 12) -> None:

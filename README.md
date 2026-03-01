@@ -29,6 +29,11 @@ Then edit `.env` and set at minimum:
 - `AI_DISCLOSURE_ENABLED=true`
 - `AI_DISCLOSURE_TEXT=This application was submitted with assistance from an AI agent.`
 - `ALWAYS_APPLY_EXCEPT_OUTSIDE_POLAND=true`
+- MCP runtime (default ON): set `MCP_LINEAR_TEAM`, `MCP_LINEAR_PROJECT`, `MCP_NOTION_DATA_SOURCE_ID`
+
+For MCP server wiring:
+- copy `data/mcp_servers.runtime.example.json` to `data/mcp_servers.runtime.json`
+- set server launch commands/args for your local MCP servers
 
 Optional, to avoid startup prompts for profile facts:
 - copy `data/profile.bootstrap.example.json` to `data/profile.bootstrap.json`
@@ -54,6 +59,9 @@ python -m src.main --no-external
 python -m src.main --system-chrome --chrome-profile Default
 python -m src.main --mode discovery_only --discover-max 60
 python -m src.main --mode discovery_and_apply --discover-max 60 --max-jobs 10
+python -m src.main --mcp-off
+python -m src.main --mcp-drain-spool-only
+python -m src.main --mcp-timeout 12
 ```
 
 Discovery env controls (`.env`):
@@ -78,6 +86,10 @@ Queue retry env controls (`.env`):
 - `data/job_discovery_cache.json`: cached discovery results keyed by query fingerprint and TTL.
 - `data/profile.bootstrap.json`: optional startup profile bootstrap (local only, gitignored).
 - `data/profile.bootstrap.example.json`: template for bootstrap profile data.
+- `data/mcp_spool.jsonl`: append-only MCP spool operation log.
+- `data/mcp_spool.dead_letter.jsonl`: MCP events that exceeded retry limit.
+- `data/mcp_linear_issue_map.json`: local dedupe map for Linear incidents.
+- `data/mcp_notion_run_map.json`: local run->Notion mapping for upsert-like updates.
 - `output/cover_letters/`: generated cover letters.
 - `output/tailored_cv/`: per-job tailoring notes.
 - `output/metrics/`: run KPI reports (`latest.json`, `run_*.json`, `runs.jsonl`).
@@ -123,6 +135,11 @@ Queue retry env controls (`.env`):
 - `AGENTIC_BLOCKED_ACTION_TOKENS` is a safety blacklist for risky button labels in agentic click fallback.
 - `AGENTIC_PLAYBOOK_CONFIDENCE_THRESHOLD` and `AGENTIC_PLAYBOOK_MIN_USES` control when memorized playbooks can auto-run.
 - `JOB_QUEUE_RETRY_LIMIT` and `JOB_QUEUE_RETRY_COOLDOWN_MINUTES` prevent retry storms for failing postings.
+- MCP bridge is fail-open by default (`MCP_FAIL_OPEN=true`): publish errors never stop job processing.
+- MCP publisher redacts PII/secrets by default (`MCP_REDACT_PII=true`).
+- MCP spool is drained automatically at start/end of every run.
+- Runtime MCP setup details: `docs/mcp_runtime_setup.md`
+- Reuse template for other repos: `docs/mcp_template.md`
 - With terminal prompts disabled, ensure `CV_PATH` and profile/bootstrap data are configured up front.
 - AI disclosure is automatically added in suitable comment/message fields and in generated cover letters.
 - Form answers are generated in the language detected from each field label/context.

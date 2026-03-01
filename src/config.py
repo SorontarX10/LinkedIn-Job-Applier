@@ -100,6 +100,23 @@ class Settings:
     discovery_cache_ttl_minutes: int
     job_queue_retry_limit: int
     job_queue_retry_cooldown_minutes: int
+    mcp_enabled: bool = True
+    mcp_fail_open: bool = True
+    mcp_config_path: Path = Path("data/mcp_servers.runtime.json")
+    mcp_spool_path: Path = Path("data/mcp_spool.jsonl")
+    mcp_publish_timeout_sec: int = 8
+    mcp_retry_limit: int = 5
+    mcp_retry_backoff_sec: int = 20
+    mcp_redact_pii: bool = True
+    mcp_linear_enabled: bool = True
+    mcp_linear_team: str = ""
+    mcp_linear_project: str = ""
+    mcp_linear_default_state: str = "Backlog"
+    mcp_notion_enabled: bool = True
+    mcp_notion_data_source_id: str = ""
+    mcp_notion_parent_page_id: str = ""
+    mcp_figma_enabled: bool = False
+    mcp_figma_file_key: str = ""
 
 
 def load_settings() -> Settings:
@@ -170,6 +187,27 @@ def load_settings() -> Settings:
     discovery_cache_ttl_minutes = max(1, int(os.getenv("DISCOVERY_CACHE_TTL_MINUTES", "90")))
     job_queue_retry_limit = max(1, int(os.getenv("JOB_QUEUE_RETRY_LIMIT", "3")))
     job_queue_retry_cooldown_minutes = max(0, int(os.getenv("JOB_QUEUE_RETRY_COOLDOWN_MINUTES", "30")))
+    mcp_enabled = _to_bool(os.getenv("MCP_ENABLED"), default=True)
+    mcp_fail_open = _to_bool(os.getenv("MCP_FAIL_OPEN"), default=True)
+    mcp_config_path = _to_path(base_dir, os.getenv("MCP_CONFIG_PATH", "data/mcp_servers.runtime.json"))
+    if mcp_config_path is None:
+        raise ValueError("MCP_CONFIG_PATH must resolve to a valid path.")
+    mcp_spool_path = _to_path(base_dir, os.getenv("MCP_SPOOL_PATH", "data/mcp_spool.jsonl"))
+    if mcp_spool_path is None:
+        raise ValueError("MCP_SPOOL_PATH must resolve to a valid path.")
+    mcp_publish_timeout_sec = max(1, int(os.getenv("MCP_PUBLISH_TIMEOUT_SEC", "8")))
+    mcp_retry_limit = max(1, int(os.getenv("MCP_RETRY_LIMIT", "5")))
+    mcp_retry_backoff_sec = max(1, int(os.getenv("MCP_RETRY_BACKOFF_SEC", "20")))
+    mcp_redact_pii = _to_bool(os.getenv("MCP_REDACT_PII"), default=True)
+    mcp_linear_enabled = _to_bool(os.getenv("MCP_LINEAR_ENABLED"), default=True)
+    mcp_linear_team = os.getenv("MCP_LINEAR_TEAM", "").strip()
+    mcp_linear_project = os.getenv("MCP_LINEAR_PROJECT", "").strip()
+    mcp_linear_default_state = os.getenv("MCP_LINEAR_DEFAULT_STATE", "Backlog").strip() or "Backlog"
+    mcp_notion_enabled = _to_bool(os.getenv("MCP_NOTION_ENABLED"), default=True)
+    mcp_notion_data_source_id = os.getenv("MCP_NOTION_DATA_SOURCE_ID", "").strip()
+    mcp_notion_parent_page_id = os.getenv("MCP_NOTION_PARENT_PAGE_ID", "").strip()
+    mcp_figma_enabled = _to_bool(os.getenv("MCP_FIGMA_ENABLED"), default=False)
+    mcp_figma_file_key = os.getenv("MCP_FIGMA_FILE_KEY", "").strip()
 
     if use_system_chrome_profile and system_chrome_user_data_dir is None:
         detected_dir, detected_channel = detect_system_browser_profile_dir()
@@ -228,4 +266,21 @@ def load_settings() -> Settings:
         discovery_cache_ttl_minutes=discovery_cache_ttl_minutes,
         job_queue_retry_limit=job_queue_retry_limit,
         job_queue_retry_cooldown_minutes=job_queue_retry_cooldown_minutes,
+        mcp_enabled=mcp_enabled,
+        mcp_fail_open=mcp_fail_open,
+        mcp_config_path=mcp_config_path,
+        mcp_spool_path=mcp_spool_path,
+        mcp_publish_timeout_sec=mcp_publish_timeout_sec,
+        mcp_retry_limit=mcp_retry_limit,
+        mcp_retry_backoff_sec=mcp_retry_backoff_sec,
+        mcp_redact_pii=mcp_redact_pii,
+        mcp_linear_enabled=mcp_linear_enabled,
+        mcp_linear_team=mcp_linear_team,
+        mcp_linear_project=mcp_linear_project,
+        mcp_linear_default_state=mcp_linear_default_state,
+        mcp_notion_enabled=mcp_notion_enabled,
+        mcp_notion_data_source_id=mcp_notion_data_source_id,
+        mcp_notion_parent_page_id=mcp_notion_parent_page_id,
+        mcp_figma_enabled=mcp_figma_enabled,
+        mcp_figma_file_key=mcp_figma_file_key,
     )

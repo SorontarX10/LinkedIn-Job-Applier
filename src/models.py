@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 
 @dataclass
@@ -67,3 +68,23 @@ class ApplicationRecord:
     status: str
     applied_at_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
     notes: str = ""
+
+
+@dataclass
+class McpEventEnvelope:
+    event_id: str
+    run_id: str
+    event_type: str
+    ts_utc: str
+    payload: dict[str, Any]
+    attempt: int = 0
+    next_retry_at_utc: str = ""
+
+
+@dataclass
+class RunSnapshot:
+    run_id: str
+    mode: str
+    ts_utc: str
+    metrics: dict[str, Any]
+    recent_operations: list[dict[str, Any]]

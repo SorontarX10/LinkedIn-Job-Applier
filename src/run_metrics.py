@@ -40,6 +40,10 @@ class RunMetricsTracker:
     discovery_queued_count: int = 0
     discovery_rejected_count: int = 0
     discovery_submitted_count: int = 0
+    mcp_publish_success: int = 0
+    mcp_publish_fail: int = 0
+    mcp_spool_backlog: int = 0
+    mcp_dead_letter_count: int = 0
     handoff_events: list[dict[str, str]] = field(default_factory=list)
     fallback_events: list[dict[str, Any]] = field(default_factory=list)
     job_events: list[dict[str, Any]] = field(default_factory=list)
@@ -148,6 +152,16 @@ class RunMetricsTracker:
             }
         )
 
+    def record_mcp_publish(self, *, success: bool) -> None:
+        if success:
+            self.mcp_publish_success += 1
+        else:
+            self.mcp_publish_fail += 1
+
+    def set_mcp_queue_stats(self, *, spool_backlog: int, dead_letter_count: int) -> None:
+        self.mcp_spool_backlog = max(0, int(spool_backlog))
+        self.mcp_dead_letter_count = max(0, int(dead_letter_count))
+
     def finalize_and_save(self) -> Path | None:
         self.run_finished_at_utc = _utc_now()
         metrics_payload = self._build_payload()
@@ -166,6 +180,9 @@ class RunMetricsTracker:
         except Exception:
             return None
         return report_path
+
+    def snapshot(self) -> dict[str, Any]:
+        return self._build_payload()
 
     def _build_payload(self) -> dict[str, Any]:
         mean_time = 0.0
@@ -200,6 +217,11 @@ class RunMetricsTracker:
         if self.discovery_queued_count > 0:
             discovery_to_apply_conversion = float(self.discovery_submitted_count) / float(self.discovery_queued_count)
 
+        mcp_publish_fail_rate = 0.0
+        mcp_total = self.mcp_publish_success + self.mcp_publish_fail
+        if mcp_total > 0:
+            mcp_publish_fail_rate = float(self.mcp_publish_fail) / float(mcp_total)
+
         return {
             "run_started_at_utc": self.run_started_at_utc,
             "run_finished_at_utc": self.run_finished_at_utc,
@@ -222,6 +244,10 @@ class RunMetricsTracker:
                 "discovery_queued_count": self.discovery_queued_count,
                 "discovery_rejected_count": self.discovery_rejected_count,
                 "discovery_submitted_count": self.discovery_submitted_count,
+                "mcp_publish_success": self.mcp_publish_success,
+                "mcp_publish_fail": self.mcp_publish_fail,
+                "mcp_spool_backlog": self.mcp_spool_backlog,
+                "mcp_dead_letter_count": self.mcp_dead_letter_count,
             },
             "kpi": {
                 "application_success_rate": round(application_success_rate, 4),
@@ -232,6 +258,7 @@ class RunMetricsTracker:
                 "mean_time_per_application_sec": round(mean_time, 3),
                 "playbook_hit_rate": round(playbook_hit_rate, 4),
                 "discovery_to_apply_conversion": round(discovery_to_apply_conversion, 4),
+                "mcp_publish_fail_rate": round(mcp_publish_fail_rate, 4),
             },
             "job_events": self.job_events[-300:],
             "fallback_events": self.fallback_events[-300:],

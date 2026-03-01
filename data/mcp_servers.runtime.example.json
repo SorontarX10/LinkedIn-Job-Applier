@@ -1,0 +1,49 @@
+{
+  "servers": {
+    "linear": {
+      "enabled": true,
+      "command": "python",
+      "args": ["-m", "your_linear_mcp_server"],
+      "env": {}
+    },
+    "notion": {
+      "enabled": true,
+      "command": "python",
+      "args": ["-m", "your_notion_mcp_server"],
+      "env": {}
+    },
+    "figma": {
+      "enabled": false,
+      "command": "python",
+      "args": ["-m", "your_figma_mcp_server"],
+      "env": {}
+    }
+  },
+  "sinks": {
+    "linear": {
+      "enabled": true,
+      "server": "linear",
+      "tools": {
+        "create_issue": "save_issue",
+        "create_comment": "create_comment",
+        "update_issue": "save_issue"
+      }
+    },
+    "notion": {
+      "enabled": true,
+      "server": "notion",
+      "tools": {
+        "create_page": "notion-create-pages",
+        "update_page": "notion-update-page"
+      }
+    },
+    "figma": {
+      "enabled": false,
+      "server": "figma",
+      "tools": {
+        "generate_diagram": "generate_diagram"
+      }
+    }
+  }
+}
+

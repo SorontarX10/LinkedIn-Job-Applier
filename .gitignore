@@ -11,6 +11,11 @@ __pycache__/
 data/knowledge.json
 data/profile.bootstrap.json
 data/browser-profile/
+data/mcp_servers.runtime.json
+data/mcp_spool.jsonl
+data/mcp_spool.dead_letter.jsonl
+data/mcp_linear_issue_map.json
+data/mcp_notion_run_map.json
 
 output/*
 !output/.gitkeep
